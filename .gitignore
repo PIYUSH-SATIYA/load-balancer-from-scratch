@@ -1,0 +1,41 @@
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Build directories
+build/
+bin/
+out/
+cmake-build-*/
+
+# Object files and executables
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.out
+*.app
+loadbalancer
+dummy_backend
+
+# Editor / IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Virtual environments / Local configurations (if any)
+.env
+.env.local

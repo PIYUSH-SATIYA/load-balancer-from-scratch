@@ -1,0 +1,48 @@
+services:
+  loadbalancer:
+    build: .
+    volumes:
+      - .:/app
+      - build_cache:/app/build
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+    networks:
+      - lbnet
+
+
+
+  nginx-comparison:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8081:80"
+    networks:
+      - lbnet
+
+  backend1:
+    build: .
+    command: ["./build/dummy_backend", "9001"]
+    networks:
+      - lbnet
+  backend2:
+    build: .
+    command: ["./build/dummy_backend", "9002"]
+    networks:
+      - lbnet
+  backend3:
+    build: .
+    command: ["./build/dummy_backend", "9003"]
+    networks:
+      - lbnet
+
+networks:
+  lbnet:
+    driver: bridge
+
+volumes:
+  build_cache:

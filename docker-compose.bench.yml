@@ -1,0 +1,11 @@
+services:
+  loadbalancer:
+    network_mode: "host"
+    ports: []          # must explicitly clear — host mode + ports: together is invalid
+  nginx-comparison:
+    network_mode: "host"
+    ports: []
+  bench:
+    build: .
+    network_mode: "host"
+    command: ["./bench/run_bench.sh"]
