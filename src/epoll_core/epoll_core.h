@@ -15,8 +15,9 @@ struct Session {
     std::string c2b_buffer; // Client -> Backend buffer
     std::string b2c_buffer; // Backend -> Client buffer
 
-    bool client_closed;
-    bool backend_closed;
+    bool client_read_closed;
+    bool backend_read_closed;
+    bool fully_closed;
 };
 
 class EpollCore {
@@ -33,12 +34,14 @@ private:
     int server_fd;
     int epoll_fd;
 
-    // Maps file descriptors to their associated Session
     std::unordered_map<int, std::shared_ptr<Session>> sessions;
 
     void set_non_blocking(int fd);
     void update_epoll(int fd, uint32_t events);
     void remove_epoll(int fd);
+    
+    void update_session_epoll(std::shared_ptr<Session> session);
+    void check_session_done(std::shared_ptr<Session> session);
 
     void handle_new_connection();
     void handle_client_read(std::shared_ptr<Session> session);

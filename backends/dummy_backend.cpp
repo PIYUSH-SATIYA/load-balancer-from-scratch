@@ -12,8 +12,13 @@ void handle_client(int client_fd) {
     while (true) {
         ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
         if (bytes_read > 0) {
-            // Echo back
-            send(client_fd, buffer, bytes_read, 0);
+            std::string http_response = 
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 13\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: keep-alive\r\n\r\n"
+                "Hello, World!";
+            send(client_fd, http_response.c_str(), http_response.length(), 0);
         } else if (bytes_read == 0) {
             std::cout << "[Backend] Client disconnected cleanly." << std::endl;
             break;
@@ -54,7 +59,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (listen(server_fd, 10) < 0) {
+    if (listen(server_fd, SOMAXCONN) < 0) {
         std::cerr << "[Backend] Listen failed\n";
         return 1;
     }
