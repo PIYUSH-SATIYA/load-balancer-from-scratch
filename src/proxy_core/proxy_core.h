@@ -1,9 +1,13 @@
 #pragma once
 #include <string>
+#include <vector>
+#include <memory>
+#include "../common/backend.h"
+#include "../lb_algorithms/lb_algorithms.h"
 
 class ProxyCore {
 public:
-    ProxyCore(int port, const std::string& backend_host, int backend_port);
+    ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm);
     ~ProxyCore();
 
     // Start the proxy loop, blocking the current thread
@@ -11,8 +15,8 @@ public:
 
 private:
     int listening_port;
-    std::string backend_host;
-    int backend_port;
+    std::vector<Backend>& backends;
+    std::shared_ptr<LbAlgorithm> algorithm;
     int server_fd;
 
     // The relay loops run in their own threads

@@ -18,7 +18,7 @@ find_package(Threads REQUIRED)
 add_executable(loadbalancer
     src/main.cpp
     src/proxy_core/proxy_core.cpp
-    src/lb_algorithms/lb_algorithms.cpp
+    src/lb_algorithms/round_robin.cpp
     src/health_checker/health_checker.cpp
 )
 target_include_directories(loadbalancer PRIVATE src)

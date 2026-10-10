@@ -10,8 +10,8 @@
 #include <cstring>
 #include <signal.h>
 
-ProxyCore::ProxyCore(int port, const std::string& backend_host, int backend_port) 
-    : listening_port(port), backend_host(backend_host), backend_port(backend_port), server_fd(-1) {
+ProxyCore::ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm) 
+    : listening_port(port), backends(backends), algorithm(algorithm), server_fd(-1) {
     
     // Suppress SIGPIPE. If we write to a socket that the other end has closed,
     // the OS sends SIGPIPE which kills the process by default. We want send() 
@@ -74,7 +74,17 @@ void ProxyCore::start() {
 
         LOG_INFO("Accepted connection from " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port));
 
-        // 6. Connect to the backend
+        // 5.5 Select a backend using the active algorithm
+        Backend* selected_backend = algorithm->select_backend(backends, inet_ntoa(client_addr.sin_addr));
+        if (!selected_backend) {
+            LOG_ERROR("No backends available!");
+            close(client_fd);
+            continue;
+        }
+
+        LOG_INFO("Routed connection to backend: " << selected_backend->ip << ":" << selected_backend->port);
+
+        // 6. Connect to the selected backend
         int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (backend_fd < 0) {
             LOG_ERROR("Failed to create backend socket: " << strerror(errno));
@@ -88,8 +98,8 @@ void ProxyCore::start() {
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
-        if (getaddrinfo(backend_host.c_str(), std::to_string(backend_port).c_str(), &hints, &res) != 0) {
-            LOG_ERROR("Failed to resolve backend hostname: " << backend_host);
+        if (getaddrinfo(selected_backend->ip.c_str(), std::to_string(selected_backend->port).c_str(), &hints, &res) != 0) {
+            LOG_ERROR("Failed to resolve backend hostname: " << selected_backend->ip);
             close(client_fd);
             close(backend_fd);
             continue;
@@ -97,15 +107,13 @@ void ProxyCore::start() {
 
         // connect() performs the TCP 3-way handshake with the backend
         if (connect(backend_fd, res->ai_addr, res->ai_addrlen) < 0) {
-            LOG_ERROR("Failed to connect to backend " << backend_host << ":" << backend_port << " - " << strerror(errno));
+            LOG_ERROR("Failed to connect to backend " << selected_backend->ip << ":" << selected_backend->port << " - " << strerror(errno));
             freeaddrinfo(res);
             close(client_fd);
             close(backend_fd);
             continue;
         }
         freeaddrinfo(res);
-        
-        LOG_INFO("Successfully connected to backend " << backend_host << ":" << backend_port);
 
         // 7. Spawn two threads to handle bidirectional relay
         // Detach them so they run independently and clean up after themselves.
