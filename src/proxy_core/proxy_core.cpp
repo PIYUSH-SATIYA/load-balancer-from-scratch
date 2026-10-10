@@ -162,8 +162,13 @@ void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& directi
 
 end_relay:
     // When one direction closes, we want to tear down both sockets.
-    // For this basic proxy, simply closing both FDs triggers an error on the 
-    // opposite thread (since it's reading/writing to a closed FD), cleanly stopping both.
+    // CRITICAL FIX: Calling close() on a file descriptor does NOT interrupt a blocking 
+    // recv() call on another thread! The other thread will hang forever.
+    // shutdown() operates on the underlying socket object and forcefully unblocks 
+    // any pending recv() or send() calls, ensuring the opposite thread wakes up and exits.
+    shutdown(from_fd, SHUT_RDWR);
+    shutdown(to_fd, SHUT_RDWR);
+    
     close(from_fd);
     close(to_fd);
 }

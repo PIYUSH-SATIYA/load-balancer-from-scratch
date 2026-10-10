@@ -1,6 +1,7 @@
 #include "proxy_core/proxy_core.h"
 #include "lb_algorithms/round_robin.h"
 #include "lb_algorithms/least_connections.h"
+#include "lb_algorithms/consistent_hashing.h"
 #include "config/config.h"
 #include "common/logger.h"
 #include <vector>
@@ -30,7 +31,9 @@ int main(int argc, char* argv[]) {
     Config config = ConfigParser::parse_cli(argc, argv);
 
     std::shared_ptr<LbAlgorithm> algo;
-    if (config.algorithm == "least_connections") {
+    if (config.algorithm == "consistent_hashing") {
+        algo = std::make_shared<ConsistentHashing>(config.backends);
+    } else if (config.algorithm == "least_connections") {
         algo = std::make_shared<LeastConnections>();
     } else if (config.algorithm == "round_robin") {
         algo = std::make_shared<RoundRobin>();

@@ -21,6 +21,7 @@ add_executable(loadbalancer
     src/config/config.cpp
     src/lb_algorithms/round_robin.cpp
     src/lb_algorithms/least_connections.cpp
+    src/lb_algorithms/consistent_hashing.cpp
     src/health_checker/health_checker.cpp
 )
 target_include_directories(loadbalancer PRIVATE src)
