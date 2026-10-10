@@ -115,14 +115,21 @@ void ProxyCore::start() {
         }
         freeaddrinfo(res);
 
-        // 7. Spawn two threads to handle bidirectional relay
-        // Detach them so they run independently and clean up after themselves.
-        std::thread(relay_traffic, client_fd, backend_fd, "Client->Backend").detach();
-        std::thread(relay_traffic, backend_fd, client_fd, "Backend->Client").detach();
+        // 7. Increment active connections
+        selected_backend->active_connections.fetch_add(1);
+
+        // 8. Spawn two threads to handle bidirectional relay
+        // We pass a shared_ptr<ConnectionTracker> to both threads.
+        // When BOTH threads finish, the shared_ptr reference count hits 0, 
+        // destroying the tracker and safely decrementing the connection exactly once.
+        auto tracker = std::make_shared<ConnectionTracker>(selected_backend);
+
+        std::thread(relay_traffic, client_fd, backend_fd, "Client->Backend", tracker).detach();
+        std::thread(relay_traffic, backend_fd, client_fd, "Backend->Client", tracker).detach();
     }
 }
 
-void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& direction) {
+void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& direction, std::shared_ptr<ConnectionTracker> /*tracker*/) {
     char buffer[8192];
     
     while (true) {

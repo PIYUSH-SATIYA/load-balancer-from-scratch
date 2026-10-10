@@ -12,5 +12,8 @@ Backend* RoundRobin::select_backend(std::vector<Backend>& backends, const std::s
     // cleanly preventing race conditions.
     unsigned int index = counter.fetch_add(1) % backends.size();
     
-    return &backends[index];
+    Backend& selected = backends[index];
+    selected.total_requests.fetch_add(1);
+    
+    return &selected;
 }
