@@ -18,6 +18,7 @@ find_package(Threads REQUIRED)
 add_executable(loadbalancer
     src/main.cpp
     src/proxy_core/proxy_core.cpp
+    src/epoll_core/epoll_core.cpp
     src/config/config.cpp
     src/lb_algorithms/round_robin.cpp
     src/lb_algorithms/least_connections.cpp

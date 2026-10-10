@@ -1,4 +1,5 @@
 #include "proxy_core/proxy_core.h"
+#include "epoll_core/epoll_core.h"
 #include "lb_algorithms/round_robin.h"
 #include "lb_algorithms/least_connections.h"
 #include "lb_algorithms/consistent_hashing.h"
@@ -51,11 +52,16 @@ int main(int argc, char* argv[]) {
     HealthChecker health_checker(config.backends, config.health_check_interval);
     health_checker.start();
 
-    // Pass configuration to the proxy
-    ProxyCore proxy(config.port, config.backends, algo);
-    
-    // start() blocks the main thread in the accept loop
-    proxy.start();
+    // Pass configuration to the requested core
+    if (config.use_epoll) {
+        LOG_INFO("Using High-Performance EpollCore architecture.");
+        EpollCore proxy(config.port, config.backends, algo);
+        proxy.start(); // Blocks main thread
+    } else {
+        LOG_INFO("Using Thread-per-Connection ProxyCore architecture.");
+        ProxyCore proxy(config.port, config.backends, algo);
+        proxy.start(); // Blocks main thread
+    }
 
     return 0;
 }

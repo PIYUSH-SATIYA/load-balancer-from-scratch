@@ -8,8 +8,8 @@ Config ConfigParser::parse_cli(int argc, char* argv[]) {
     Config config;
     
     int opt;
-    // -p: port, -a: algorithm, -h: health check interval, -b: backend
-    while ((opt = getopt(argc, argv, "p:a:h:b:")) != -1) {
+    // -p: port, -a: algorithm, -h: health check interval, -b: backend, -e: enable epoll
+    while ((opt = getopt(argc, argv, "p:a:h:b:e")) != -1) {
         switch (opt) {
             case 'p':
                 config.port = std::stoi(optarg);
@@ -33,8 +33,11 @@ Config ConfigParser::parse_cli(int argc, char* argv[]) {
                 }
                 break;
             }
+            case 'e':
+                config.use_epoll = true;
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [-p port] [-a algorithm] [-h health_check_interval_sec] [-b backend_ip:port]..." << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [-p port] [-a algorithm] [-h health_check_interval_sec] [-b backend_ip:port]... [-e]" << std::endl;
                 exit(1);
         }
     }
