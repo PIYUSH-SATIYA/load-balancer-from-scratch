@@ -7,13 +7,21 @@ Backend* RoundRobin::select_backend(std::vector<Backend>& backends, const std::s
         return nullptr;
     }
 
-    // fetch_add(1) atomically increments the counter and returns the value BEFORE the increment.
-    // This guarantees no two threads will ever get the same counter value, 
-    // cleanly preventing race conditions.
-    unsigned int index = counter.fetch_add(1) % backends.size();
+    // Try up to backends.size() times to find an UP backend
+    for (size_t i = 0; i < backends.size(); ++i) {
+        // fetch_add(1) atomically increments the counter and returns the value BEFORE the increment.
+        unsigned int index = counter.fetch_add(1) % backends.size();
+        
+        Backend& selected = backends[index];
+        
+        // If it's UP, we found our target!
+        if (selected.status.load() == BackendStatus::UP) {
+            selected.total_requests.fetch_add(1);
+            return &selected;
+        }
+        // If DOWN, the loop continues and it grabs the next one
+    }
     
-    Backend& selected = backends[index];
-    selected.total_requests.fetch_add(1);
-    
-    return &selected;
+    // If we checked all backends and they are all DOWN
+    return nullptr;
 }

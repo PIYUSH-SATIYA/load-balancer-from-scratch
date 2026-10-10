@@ -10,7 +10,7 @@ enum class BackendStatus {
 struct Backend {
     std::string ip;
     int port;
-    BackendStatus status;
+    std::atomic<BackendStatus> status;
     std::atomic<int> active_connections;
     std::atomic<int> total_requests;
 
@@ -25,7 +25,7 @@ struct Backend {
     Backend(Backend&& other) noexcept 
         : ip(std::move(other.ip)), 
           port(other.port), 
-          status(other.status), 
+          status(other.status.load()), 
           active_connections(other.active_connections.load()),
           total_requests(other.total_requests.load()) {}
 };

@@ -2,6 +2,7 @@
 #include "lb_algorithms/round_robin.h"
 #include "lb_algorithms/least_connections.h"
 #include "lb_algorithms/consistent_hashing.h"
+#include "health_checker/health_checker.h"
 #include "config/config.h"
 #include "common/logger.h"
 #include <vector>
@@ -45,6 +46,10 @@ int main(int argc, char* argv[]) {
     // Register signal handler to print stats on demand
     global_backends = &config.backends;
     std::signal(SIGUSR1, handle_sigusr1);
+
+    // Start the health checker background thread
+    HealthChecker health_checker(config.backends, config.health_check_interval);
+    health_checker.start();
 
     // Pass configuration to the proxy
     ProxyCore proxy(config.port, config.backends, algo);
