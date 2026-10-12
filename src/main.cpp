@@ -9,6 +9,8 @@
 #include <vector>
 #include <memory>
 #include <csignal>
+#include <thread>
+#include <pthread.h>
 
 // Global pointer purely so the signal handler can print the stats
 std::vector<Backend>* global_backends = nullptr;
@@ -27,7 +29,7 @@ void handle_sigusr1(int /*sig*/) {
 }
 
 int main(int argc, char* argv[]) {
-    LOG_INFO("Starting Load Balancer (Iteration 4: Config & Logging)");
+    LOG_INFO("Starting Load Balancer...");
 
     // Parse command-line arguments
     Config config = ConfigParser::parse_cli(argc, argv);
@@ -54,9 +56,29 @@ int main(int argc, char* argv[]) {
 
     // Pass configuration to the requested core
     if (config.use_epoll) {
-        LOG_INFO("Using High-Performance EpollCore architecture.");
-        EpollCore proxy(config.port, config.backends, algo);
-        proxy.start(); // Blocks main thread
+        if (config.workers > 1) {
+            LOG_INFO("Using High-Performance EpollCore architecture with " << config.workers << " workers (SO_REUSEPORT).");
+            std::vector<std::thread> workers;
+            for (int i = 0; i < config.workers; ++i) {
+                workers.emplace_back([&config, algo, i]() {
+                    cpu_set_t cpuset;
+                    CPU_ZERO(&cpuset);
+                    CPU_SET(i, &cpuset);
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+                    LOG_INFO("Worker " << i << " started EpollCore on Core " << i);
+                    EpollCore proxy(config.port, config.backends, algo);
+                    proxy.start();
+                });
+            }
+            for (auto& w : workers) {
+                if (w.joinable()) w.join();
+            }
+        } else {
+            LOG_INFO("Using High-Performance EpollCore architecture (Single Core).");
+            EpollCore proxy(config.port, config.backends, algo);
+            proxy.start(); // Blocks main thread
+        }
     } else {
         LOG_INFO("Using Thread-per-Connection ProxyCore architecture.");
         ProxyCore proxy(config.port, config.backends, algo);

@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <chrono>
 
+#include <poll.h>
+
 HealthChecker::HealthChecker(std::vector<Backend>& backends, int interval) 
     : backends(backends), interval_seconds(interval), running(false) {}
 
@@ -28,8 +30,7 @@ bool HealthChecker::check_backend(const std::string& ip, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
 
-    // Set socket to non-blocking. If a backend is completely unresponsive (e.g. dropped packets),
-    // a blocking connect() could hang for a long time (OS default is often minutes).
+    // Set socket to non-blocking.
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -49,21 +50,17 @@ bool HealthChecker::check_backend(const std::string& ip, int port) {
     if (result == 0) {
         is_up = true; // Connected immediately
     } else if (result < 0 && errno == EINPROGRESS) {
-        // Connection is in progress. We wait up to 2 seconds for it to succeed.
-        fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(sock, &fdset);
-        
-        struct timeval tv;
-        tv.tv_sec = 2; // 2 seconds timeout
-        tv.tv_usec = 0;
+        // Use poll instead of select! select/fd_set overflows when sock >= 1024,
+        // causing __FD_SET_chk buffer overflow aborts during high connection tests.
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
 
-        // select() will unblock if the socket becomes writable (meaning connection succeeded or failed)
-        if (select(sock + 1, nullptr, &fdset, nullptr, &tv) == 1) {
-            int so_error;
+        if (poll(&pfd, 1, 2000) > 0) { // 2 seconds timeout
+            int so_error = 0;
             socklen_t len = sizeof(so_error);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
-            if (so_error == 0) {
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 && so_error == 0) {
                 is_up = true;
             }
         }

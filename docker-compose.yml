@@ -14,6 +14,10 @@ services:
       - backend3
     networks:
       - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # Will run manually during dev
 
   nginx-comparison:
@@ -21,9 +25,13 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "8081:80"
+      - "8081:8080"
     networks:
       - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   backend1:
     build:
@@ -35,6 +43,10 @@ services:
     command: ["/app/build/dummy_backend", "9001"]
     networks:
       - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   backend2:
     build:
@@ -46,6 +58,10 @@ services:
     command: ["/app/build/dummy_backend", "9002"]
     networks:
       - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   backend3:
     build:
@@ -57,6 +73,10 @@ services:
     command: ["/app/build/dummy_backend", "9003"]
     networks:
       - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
 networks:
   lbnet:

@@ -8,6 +8,7 @@ struct Config {
     std::string algorithm = "round_robin";
     int health_check_interval = 5;
     bool use_epoll = false;
+    int workers = 1;
     std::vector<Backend> backends;
 };
 

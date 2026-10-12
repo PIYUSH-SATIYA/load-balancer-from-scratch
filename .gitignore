@@ -39,3 +39,8 @@ dummy_backend
 # Virtual environments / Local configurations (if any)
 .env
 .env.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class

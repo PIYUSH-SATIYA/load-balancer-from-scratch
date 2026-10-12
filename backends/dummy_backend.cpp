@@ -1,7 +1,6 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -66,7 +65,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[Backend] Started echo server on port " << port << std::endl;
 
-    std::vector<std::thread> threads;
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -80,8 +78,7 @@ int main(int argc, char* argv[]) {
                   << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) 
                   << std::endl;
 
-        threads.emplace_back(std::thread(handle_client, client_fd));
-        threads.back().detach(); // Detach so we don't need to join it
+        std::thread(handle_client, client_fd).detach();
     }
 
     return 0;

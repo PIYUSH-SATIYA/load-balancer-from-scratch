@@ -30,5 +30,5 @@ private:
     int server_fd;
 
     // The relay loops run in their own threads, tracker ensures decrements happen exactly once
-    static void relay_traffic(int from_fd, int to_fd, const std::string& direction, std::shared_ptr<ConnectionTracker> tracker);
+    static void relay_traffic(int from_fd, int to_fd, std::shared_ptr<ConnectionTracker> tracker);
 };

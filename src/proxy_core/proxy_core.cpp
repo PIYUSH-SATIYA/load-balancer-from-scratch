@@ -36,10 +36,8 @@ void ProxyCore::start() {
 
     // 2. Allow immediate port reuse (prevents TIME_WAIT binding issues)
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        LOG_ERROR("setsockopt SO_REUSEADDR failed: " << strerror(errno));
-        return;
-    }
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     // 3. Bind to the listening port
     struct sockaddr_in address;
@@ -52,15 +50,15 @@ void ProxyCore::start() {
         return;
     }
 
-    // 4. Listen for incoming connections
-    if (listen(server_fd, 128) < 0) {
+    // 4. Listen for incoming connections (use SOMAXCONN instead of 128)
+    if (listen(server_fd, SOMAXCONN) < 0) {
         LOG_ERROR("Listen failed: " << strerror(errno));
         return;
     }
 
     LOG_INFO("Proxy listening on port " << listening_port << "...");
 
-    // 5. Main Accept Loop
+    // 5. Main Accept Loop: accept client and immediately delegate backend connection to worker thread
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -72,64 +70,56 @@ void ProxyCore::start() {
             continue;
         }
 
-        LOG_INFO("Accepted connection from " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port));
+        std::string client_ip = inet_ntoa(client_addr.sin_addr);
 
-        // 5.5 Select a backend using the active algorithm
-        Backend* selected_backend = algorithm->select_backend(backends, inet_ntoa(client_addr.sin_addr));
-        if (!selected_backend) {
-            LOG_ERROR("No backends available!");
+        // Spawn a connection handler thread immediately to keep accept loop free of blocking I/O
+        try {
+            std::thread([this, client_fd, client_ip]() {
+                Backend* selected_backend = algorithm->select_backend(backends, client_ip);
+                if (!selected_backend) {
+                    close(client_fd);
+                    return;
+                }
+
+                int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (backend_fd < 0) {
+                    close(client_fd);
+                    return;
+                }
+
+                if (!selected_backend->addr_resolved) {
+                    if (!selected_backend->resolve_address()) {
+                        close(client_fd);
+                        close(backend_fd);
+                        return;
+                    }
+                }
+
+                if (connect(backend_fd, (struct sockaddr*)&selected_backend->addr, sizeof(selected_backend->addr)) < 0) {
+                    close(client_fd);
+                    close(backend_fd);
+                    return;
+                }
+
+                selected_backend->active_connections.fetch_add(1);
+                auto tracker = std::make_shared<ConnectionTracker>(selected_backend);
+
+                // Spawn second relay thread for backend->client, and use this current thread for client->backend
+                try {
+                    std::thread(relay_traffic, backend_fd, client_fd, tracker).detach();
+                    relay_traffic(client_fd, backend_fd, tracker);
+                } catch (const std::system_error& e) {
+                    close(client_fd);
+                    close(backend_fd);
+                }
+            }).detach();
+        } catch (const std::system_error& e) {
             close(client_fd);
-            continue;
         }
-
-        LOG_INFO("Routed connection to backend: " << selected_backend->ip << ":" << selected_backend->port);
-
-        // 6. Connect to the selected backend
-        int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (backend_fd < 0) {
-            LOG_ERROR("Failed to create backend socket: " << strerror(errno));
-            close(client_fd);
-            continue;
-        }
-
-        // Resolve backend hostname (Docker compose DNS resolving)
-        struct addrinfo hints, *res;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        if (getaddrinfo(selected_backend->ip.c_str(), std::to_string(selected_backend->port).c_str(), &hints, &res) != 0) {
-            LOG_ERROR("Failed to resolve backend hostname: " << selected_backend->ip);
-            close(client_fd);
-            close(backend_fd);
-            continue;
-        }
-
-        // connect() performs the TCP 3-way handshake with the backend
-        if (connect(backend_fd, res->ai_addr, res->ai_addrlen) < 0) {
-            LOG_ERROR("Failed to connect to backend " << selected_backend->ip << ":" << selected_backend->port << " - " << strerror(errno));
-            freeaddrinfo(res);
-            close(client_fd);
-            close(backend_fd);
-            continue;
-        }
-        freeaddrinfo(res);
-
-        // 7. Increment active connections
-        selected_backend->active_connections.fetch_add(1);
-
-        // 8. Spawn two threads to handle bidirectional relay
-        // We pass a shared_ptr<ConnectionTracker> to both threads.
-        // When BOTH threads finish, the shared_ptr reference count hits 0, 
-        // destroying the tracker and safely decrementing the connection exactly once.
-        auto tracker = std::make_shared<ConnectionTracker>(selected_backend);
-
-        std::thread(relay_traffic, client_fd, backend_fd, "Client->Backend", tracker).detach();
-        std::thread(relay_traffic, backend_fd, client_fd, "Backend->Client", tracker).detach();
     }
 }
 
-void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& direction, std::shared_ptr<ConnectionTracker> /*tracker*/) {
+void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<ConnectionTracker> /*tracker*/) {
     char buffer[8192];
     
     while (true) {
@@ -139,12 +129,9 @@ void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& directi
         // --- CONNECTION CLOSE VS ERROR DETECTION ---
         if (bytes_read == 0) {
             // recv() returns exactly 0 when the peer performs an orderly shutdown (TCP FIN).
-            LOG_INFO("[" << direction << "] Connection closed gracefully by peer.");
             break;
         } else if (bytes_read < 0) {
             // recv() returns -1 on an error.
-            // ECONNRESET means the peer hard-aborted the connection (TCP RST).
-            LOG_WARN("[" << direction << "] Read error: " << strerror(errno));
             break;
         }
 
@@ -153,7 +140,6 @@ void ProxyCore::relay_traffic(int from_fd, int to_fd, const std::string& directi
         while (bytes_sent < bytes_read) {
             ssize_t result = send(to_fd, buffer + bytes_sent, bytes_read - bytes_sent, 0);
             if (result < 0) {
-                LOG_WARN("[" << direction << "] Write error: " << strerror(errno));
                 goto end_relay; // Break out of both loops
             }
             bytes_sent += result;
