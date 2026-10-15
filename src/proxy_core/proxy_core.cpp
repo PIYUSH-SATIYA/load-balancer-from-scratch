@@ -10,8 +10,8 @@
 #include <cstring>
 #include <signal.h>
 
-ProxyCore::ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm) 
-    : listening_port(port), backends(backends), algorithm(algorithm), server_fd(-1) {
+ProxyCore::ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm, bool passive_failover) 
+    : listening_port(port), backends(backends), algorithm(algorithm), passive_failover(passive_failover), server_fd(-1) {
     
     // Suppress SIGPIPE. If we write to a socket that the other end has closed,
     // the OS sends SIGPIPE which kills the process by default. We want send() 
@@ -56,7 +56,7 @@ void ProxyCore::start() {
         return;
     }
 
-    LOG_INFO("Proxy listening on port " << listening_port << "...");
+    LOG_INFO("Proxy listening on port " << listening_port << " (Passive Failover: " << (passive_failover ? "ON" : "OFF") << ")...");
 
     // 5. Main Accept Loop: accept client and immediately delegate backend connection to worker thread
     while (true) {
@@ -75,29 +75,47 @@ void ProxyCore::start() {
         // Spawn a connection handler thread immediately to keep accept loop free of blocking I/O
         try {
             std::thread([this, client_fd, client_ip]() {
-                Backend* selected_backend = algorithm->select_backend(backends, client_ip);
-                if (!selected_backend) {
-                    close(client_fd);
-                    return;
-                }
+                Backend* selected_backend = nullptr;
+                int backend_fd = -1;
+                size_t max_attempts = passive_failover ? backends.size() : 1;
 
-                int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
-                if (backend_fd < 0) {
-                    close(client_fd);
-                    return;
-                }
+                for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+                    selected_backend = algorithm->select_backend(backends, client_ip);
+                    if (!selected_backend) break;
 
-                if (!selected_backend->addr_resolved) {
-                    if (!selected_backend->resolve_address()) {
-                        close(client_fd);
-                        close(backend_fd);
-                        return;
+                    backend_fd = socket(AF_INET, SOCK_STREAM, 0);
+                    if (backend_fd < 0) break;
+
+                    if (!selected_backend->addr_resolved) {
+                        if (!selected_backend->resolve_address()) {
+                            close(backend_fd);
+                            backend_fd = -1;
+                            if (passive_failover) {
+                                selected_backend->status.store(BackendStatus::DOWN);
+                                LOG_WARN("PassiveFailover (ProxyCore): Failed to resolve " << selected_backend->ip << ":" << selected_backend->port << ", marking DOWN.");
+                                continue;
+                            }
+                            break;
+                        }
                     }
+
+                    if (connect(backend_fd, (struct sockaddr*)&selected_backend->addr, sizeof(selected_backend->addr)) < 0) {
+                        close(backend_fd);
+                        backend_fd = -1;
+                        if (passive_failover) {
+                            selected_backend->status.store(BackendStatus::DOWN);
+                            LOG_WARN("PassiveFailover (ProxyCore): Backend " << selected_backend->ip << ":" << selected_backend->port << " failed to connect (" << strerror(errno) << "), marking DOWN and retrying next backend.");
+                            continue;
+                        }
+                        break;
+                    }
+
+                    // Successfully connected
+                    break;
                 }
 
-                if (connect(backend_fd, (struct sockaddr*)&selected_backend->addr, sizeof(selected_backend->addr)) < 0) {
+                if (backend_fd < 0 || !selected_backend) {
                     close(client_fd);
-                    close(backend_fd);
                     return;
                 }
 

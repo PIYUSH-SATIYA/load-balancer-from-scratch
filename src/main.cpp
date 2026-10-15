@@ -67,7 +67,7 @@ int main(int argc, char* argv[]) {
                     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
                     LOG_INFO("Worker " << i << " started EpollCore on Core " << i);
-                    EpollCore proxy(config.port, config.backends, algo);
+                    EpollCore proxy(config.port, config.backends, algo, config.passive_failover);
                     proxy.start();
                 });
             }
@@ -76,12 +76,12 @@ int main(int argc, char* argv[]) {
             }
         } else {
             LOG_INFO("Using High-Performance EpollCore architecture (Single Core).");
-            EpollCore proxy(config.port, config.backends, algo);
+            EpollCore proxy(config.port, config.backends, algo, config.passive_failover);
             proxy.start(); // Blocks main thread
         }
     } else {
         LOG_INFO("Using Thread-per-Connection ProxyCore architecture.");
-        ProxyCore proxy(config.port, config.backends, algo);
+        ProxyCore proxy(config.port, config.backends, algo, config.passive_failover);
         proxy.start(); // Blocks main thread
     }
 

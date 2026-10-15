@@ -4,7 +4,7 @@ FROM ubuntu:24.04 AS dev
 RUN apt-get update && apt-get install -y \
     build-essential cmake git \
     libssl-dev unzip libpcre3-dev zlib1g-dev \
-    netcat-openbsd curl iproute2 \
+    netcat-openbsd curl iproute2 python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # wrk isn't in Ubuntu's default repos — build it once, bake into image

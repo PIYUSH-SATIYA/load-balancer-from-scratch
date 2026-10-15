@@ -17,7 +17,7 @@ struct ConnectionTracker {
 
 class ProxyCore {
 public:
-    ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm);
+    ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm, bool passive_failover = true);
     ~ProxyCore();
 
     // Start the proxy loop, blocking the current thread
@@ -27,6 +27,7 @@ private:
     int listening_port;
     std::vector<Backend>& backends;
     std::shared_ptr<LbAlgorithm> algorithm;
+    bool passive_failover;
     int server_fd;
 
     // The relay loops run in their own threads, tracker ensures decrements happen exactly once
