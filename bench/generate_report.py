@@ -74,7 +74,7 @@ def idle_section():
     if "ThreadsLoad" not in rows[0]:
         return ("The available CSV uses the previous idle harness. Its thread counts are inconsistent with the thread-per-connection implementation, "
                 "so those rows are retained as historical data but are not used to claim a memory or connection-capacity comparison. Rerun `bench/run_idle_test.sh`.")
-    out = ["| Mode | Target | Established | Conn/s | Threads base→load | RSS base→load (Δ MB) | PSS base→load (Δ MB) | VmSize base→load (MB) | FDs base→load | PSS Δ/connection (KB) | Cgroup Δ MB | nofile soft/hard | Probe P50 ms | Client failures | Sampler issue | Status |",
+    out = ["| Mode | Target | Established | Conn/s | Threads base→load | RSS base→load (Δ MB) | PSS base→load (Δ MB) | VmSize base→load (GB) | FDs base→load | PSS Δ/connection (KB) | Cgroup Δ MB | nofile soft/hard | Probe P50 ms | Client failures | Sampler issue | Status |",
            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- | :--- |"]
     for row in rows:
         try:
@@ -89,6 +89,13 @@ def idle_section():
             if delta and row.get(delta, ""):
                 value += f" ({row[delta]})"
             return value
+        def gb_pair(before, after):
+            def convert(value):
+                try:
+                    return f"{float(value) / 1024:.2f}"
+                except (ValueError, TypeError):
+                    return "—"
+            return f"{convert(row.get(before))}→{convert(row.get(after))}"
         cgroup_delta = row.get("CgroupDeltaMB") or "—"
         nofile = f"{row.get('NofileSoft')}/{row.get('NofileHard')}" if row.get("NofileSoft") and row.get("NofileHard") else "—"
         out.append("| {Architecture} | {TargetConns} | {EstablishedConns} | {ConnRate} | {threads} | {rss} | {pss} | {vms} | {fds} | {per_connection} | {cgroup_delta} | {nofile} | {ActiveLatencyP50ms} | {ClientFailures} | {SamplerError} | {Status} |".format(
@@ -96,13 +103,51 @@ def idle_section():
             threads=pair("ThreadsBaseline", "ThreadsLoad"),
             rss=pair("RSSBaselineMB", "RSSLoadMB", "RSSDeltaMB"),
             pss=pair("PSSBaselineMB", "PSSLoadMB", "PSSDeltaMB"),
-            vms=pair("VmSizeBaselineMB", "VmSizeLoadMB"),
+            vms=gb_pair("VmSizeBaselineMB", "VmSizeLoadMB"),
             fds=pair("FdsBaseline", "FdsLoad"),
             per_connection=per_connection,
             cgroup_delta=cgroup_delta,
             nofile=nofile,
         ))
     return "\n".join(out)
+
+
+def idle_memory_interpretation():
+    path = RESULTS / "idle_sweep_isolated.csv"
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    epoll = next((r for r in rows if r.get("Architecture") == "Epoll_Optimized" and r.get("TargetConns") == "10000"), None)
+    threaded = next((r for r in rows if r.get("Architecture") == "Threaded_Proxy" and r.get("TargetConns") == "10000"), None)
+    if not epoll or not threaded:
+        return "A same-target 10,000-connection comparison is unavailable in the current idle CSV."
+    added_threads = max(1, int(threaded["ThreadsLoad"]) - int(threaded["ThreadsBaseline"]))
+    vmsize_per_thread = (float(threaded["VmSizeLoadMB"]) - float(threaded["VmSizeBaselineMB"])) / added_threads
+    return (
+        "At the 10,000 target, epoll established {e} connections (RSS {erss} MB, PSS {epss} MB, "
+        "VmSize {evms} GB); thread-per-connection established {t} (RSS {trss} MB, PSS {tpss} MB, "
+        "VmSize {tvms} GB). That threaded VmSize increase averages about {stack_mb} MB per added thread, "
+        "consistent with per-thread stack reservations. VmSize is virtual address space; "
+        "it is not physical RAM usage. RSS and PSS are resident process memory, and neither includes kernel TCP socket memory. "
+        "The threaded row is {status}; its active-probe result and incomplete responses are shown in the table."
+    ).format(
+        e=epoll["EstablishedConns"], erss=epoll["RSSLoadMB"], epss=epoll["PSSLoadMB"], evms=fnum(float(epoll["VmSizeLoadMB"]) / 1024),
+        t=threaded["EstablishedConns"], trss=threaded["RSSLoadMB"], tpss=threaded["PSSLoadMB"], tvms=fnum(float(threaded["VmSizeLoadMB"]) / 1024),
+        stack_mb=fnum(vmsize_per_thread), status=threaded["Status"],
+    )
+
+
+def suite_coverage():
+    path = RESULTS / "final_suite_manifest.json"
+    if not path.exists():
+        return "Final-suite rerun coverage was not recorded."
+    data = json.loads(path.read_text())
+    throughput = data["throughput"]
+    other = data["completed_suites"]
+    return (
+        f"Final-suite coverage ({data['run_date']}): idle capacity, failover ({other['failover_trials_per_mode']} trials per mode), "
+        f"routing algorithms ({other['algorithm_runs']} runs), half-close checks, and active throughput were rerun. "
+        f"Throughput coverage: {throughput['summary']}"
+    )
 
 
 def throughput_metadata():
@@ -117,7 +162,7 @@ def throughput_metadata():
             f"load-generator CPUs `{data['load_generator_cpu_set']}`; backend CPUs `{data.get('backend_cpu_set', 'unknown')}`; "
             f"Nginx CPUs `{data.get('nginx_cpu_set', 'unknown')}`. Platform: `{data['platform']}`; "
             f"kernel `{data.get('kernel_release', 'unknown')}`; CPUs `{data.get('cpu_count', 'unknown')}`; "
-            f"wrk `{wrk_version}`.")
+            f"wrk `{wrk_version}`; raw logs `{data.get('raw_output_directory', 'results/raw')}`.")
 
 
 def failover_section():
@@ -197,11 +242,13 @@ Every table below is generated from the current files in `results/`. The CSV and
 
 `wrk` measures HTTP request throughput over the TCP proxy. This is a short loopback microbenchmark using the included small HTTP responder, not a general proxy-performance result or production capacity test. It has no long soak, overload recovery, or process-level CPU/memory profile. `wrk 4.2.0 --latency` emits P50, P75, P90, and P99 in this setup; it does not emit P95 or P99.9. Runs with different environment or concurrency settings should be treated as separate experiments. “Pinned CPU set busy” is host CPU time for the selected CPU IDs, not CPU time attributed to the proxy process.
 
+{suite_coverage()}
+
 {throughput_metadata()}
 
 ## Active throughput and latency
 
-`bench/run_bench.sh` records one row per mode, concurrency, and repetition. The table reports medians for RPS, latency, pinned CPU set use, and context switches; ranges show RPS spread. Per-thread context switches are sampled during each measurement and summed for thread IDs observed in that interval. The harness records failures and raw `wrk` output under `results/raw/`.
+`bench/run_bench.sh` records one row per mode, concurrency, and repetition. The table reports medians for RPS, latency, pinned CPU set use, and context switches; ranges show RPS spread. Per-thread context switches are sampled during each measurement and summed for thread IDs observed in that interval. The manifest records where the raw `wrk` output was written.
 
 {throughput_section()}
 
@@ -210,6 +257,8 @@ Every table below is generated from the current files in `results/`. The CSV and
 `bench/run_idle_test.sh` measures the exact proxy PID before and during the hold. The client runs outside the proxy container, each cell uses fresh loopback source addresses to avoid earlier sockets in `TIME_WAIT`, and the harness records process threads, RSS, PSS, virtual size, file descriptors, open-file limits, client failures and proxy-container cgroup deltas. Host-mode cgroup fields are blank because the proxy and client share a host cgroup. `Established` is the actual number opened. `PASS` requires reaching the target and passing the active probe; `PARTIAL` means the target was missed while the probe worked; `FAILED` means the probe or proxy measurement failed. The per-connection PSS delta is process PSS growth divided by the established count, not total kernel memory per socket. A sampler issue is reported separately so resource exhaustion is not hidden as a proxy measurement.
 
 {idle_section()}
+
+{idle_memory_interpretation()}
 
 ## Backend failure and recovery
 

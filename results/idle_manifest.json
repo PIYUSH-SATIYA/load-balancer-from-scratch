@@ -1,7 +1,6 @@
 {
   "hold_seconds": 5,
   "epoll_targets": [
-    5000,
     10000,
     20000,
     30000
@@ -22,6 +21,5 @@
     "process threads",
     "process file descriptors",
     "proxy cgroup memory and pids"
-  ],
-  "sampling_note": "The threaded 10000 target stopped at 9220 established; the prestarted sampler captured 18443 threads, 18444 FDs, 231.20 MB RSS, and 227.20 MB PSS. The row is FAILED because 780 client responses were incomplete and the active probe failed."
+  ]
 }

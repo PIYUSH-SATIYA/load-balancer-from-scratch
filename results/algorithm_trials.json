@@ -16,55 +16,55 @@
         "stats": {
           "9001": {
             "status": "UP",
+            "active": 0,
+            "selections": 11
+          },
+          "9002": {
+            "status": "UP",
+            "active": 0,
+            "selections": 10
+          },
+          "9003": {
+            "status": "UP",
+            "active": 0,
+            "selections": 10
+          }
+        }
+      },
+      {
+        "counts": {
+          "9002": 10,
+          "9003": 10,
+          "9001": 10
+        },
+        "stats": {
+          "9001": {
+            "status": "UP",
+            "active": 0,
+            "selections": 11
+          },
+          "9002": {
+            "status": "UP",
+            "active": 0,
+            "selections": 10
+          },
+          "9003": {
+            "status": "UP",
+            "active": 0,
+            "selections": 10
+          }
+        }
+      },
+      {
+        "counts": {
+          "9002": 10,
+          "9003": 10,
+          "9001": 10
+        },
+        "stats": {
+          "9001": {
+            "status": "UP",
             "active": 1,
-            "selections": 11
-          },
-          "9002": {
-            "status": "UP",
-            "active": 0,
-            "selections": 10
-          },
-          "9003": {
-            "status": "UP",
-            "active": 0,
-            "selections": 10
-          }
-        }
-      },
-      {
-        "counts": {
-          "9002": 10,
-          "9003": 10,
-          "9001": 10
-        },
-        "stats": {
-          "9001": {
-            "status": "UP",
-            "active": 0,
-            "selections": 11
-          },
-          "9002": {
-            "status": "UP",
-            "active": 0,
-            "selections": 10
-          },
-          "9003": {
-            "status": "UP",
-            "active": 0,
-            "selections": 10
-          }
-        }
-      },
-      {
-        "counts": {
-          "9002": 10,
-          "9003": 10,
-          "9001": 10
-        },
-        "stats": {
-          "9001": {
-            "status": "UP",
-            "active": 0,
             "selections": 11
           },
           "9002": {
@@ -302,7 +302,7 @@
           },
           "9003": {
             "status": "UP",
-            "active": 1,
+            "active": 0,
             "selections": 19
           }
         }

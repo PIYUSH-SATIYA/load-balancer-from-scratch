@@ -12,6 +12,7 @@ RESULTS_DIR="$PROJECT_ROOT/results"
 mkdir -p "$RESULTS_DIR"
 
 SUMMARY_CSV="$RESULTS_DIR/summary.csv"
+RAW_DIR="${RAW_DIR:-$RESULTS_DIR/raw}"
 WARMUP_SEC="${WARMUP_SEC:-3}"
 DURATION_SEC="${DURATION_SEC:-10}"
 N_RUNS="${N_RUNS:-5}"
@@ -33,15 +34,19 @@ export WARMUP_SEC DURATION_SEC N_RUNS PIN_PROXY_1CORE PIN_PROXY_4CORE PIN_LOADGE
 # Binary paths
 LB_BIN="${LB_BIN:-$PROJECT_ROOT/build/loadbalancer}"
 BACKEND_BIN="${BACKEND_BIN:-$PROJECT_ROOT/build/dummy_backend}"
-WRK_BIN="$(command -v wrk || echo "/usr/local/bin/wrk")"
-export WRK_BIN
+WRK_BIN="${WRK_BIN:-$(command -v wrk || echo "/usr/local/bin/wrk")}"
+LB_BACKENDS="${LB_BACKENDS:-backend1:9001 backend2:9002 backend3:9003}"
+read -r -a BACKEND_TARGETS <<< "$LB_BACKENDS"
+BACKEND_ARGS=()
+for backend in "${BACKEND_TARGETS[@]}"; do BACKEND_ARGS+=(-b "$backend"); done
+export WRK_BIN LB_BACKENDS RAW_DIR
 
 if [ ! -x "$WRK_BIN" ]; then
     echo "ERROR: 'wrk' binary not found at $WRK_BIN. Please install wrk or run inside benchmark container." >&2
     exit 1
 fi
 
-mkdir -p "$RESULTS_DIR/raw"
+mkdir -p "$RAW_DIR"
 echo "Mode,Connections,Repeat,RPS,P50_ms,P75_ms,P90_ms,P99_ms,Requests,SocketErrors,Non2xx,Core_Busy,Core_Sys,Core_Soft,CPU_Per_kRPS,CSW_per_s,NVCSW_per_s,CSW_Threads_Sampled,Status" > "$SUMMARY_CSV"
 CURRENT_PROXY_PID=""
 CURRENT_CSW_PID=""
@@ -139,25 +144,25 @@ run_benchmark_cell() {
             fi
             ;;
         "Epoll_Optimized")
-            taskset -c "$PIN_PROXY_1CORE" "$LB_BIN" -e -p 8080 > /dev/null 2>&1 &
+            taskset -c "$PIN_PROXY_1CORE" "$LB_BIN" -e -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
             target_url="http://127.0.0.1:8080/"
             ;;
         "Epoll_4Workers")
-            taskset -c "$PIN_PROXY_4CORE" "$LB_BIN" -e -w 4 -p 8080 > /dev/null 2>&1 &
+            taskset -c "$PIN_PROXY_4CORE" "$LB_BIN" -e -w 4 -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
             target_url="http://127.0.0.1:8080/"
             ;;
         "Threaded_Proxy")
-            taskset -c "$PIN_PROXY_1CORE" "$LB_BIN" -p 8080 > /dev/null 2>&1 &
+            taskset -c "$PIN_PROXY_1CORE" "$LB_BIN" -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
             target_url="http://127.0.0.1:8080/"
             ;;
         "Threaded_4Cores")
-            taskset -c "$PIN_PROXY_4CORE" "$LB_BIN" -p 8080 > /dev/null 2>&1 &
+            taskset -c "$PIN_PROXY_4CORE" "$LB_BIN" -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
             target_url="http://127.0.0.1:8080/"
@@ -196,7 +201,7 @@ run_benchmark_cell() {
     local -a proxy_cores
     read -r -a proxy_cores <<< "$(parse_cpu_set "$cpu_set")"
     local core_before=$(get_core_stat "${proxy_cores[@]}")
-    local csw_output="$RESULTS_DIR/raw/${mode}_c${conns}_r${rep}_csw.json"
+    local csw_output="$RAW_DIR/${mode}_c${conns}_r${rep}_csw.json"
     local vol_rate="NA" nvol_rate="NA" sampled_threads=0
     if [ -n "$proxy_pid" ]; then
         rm -f "$csw_output"
@@ -210,7 +215,9 @@ run_benchmark_cell() {
     echo "  > Measuring (${DURATION_SEC}s @ $conns conns)..."
     local wrk_raw
     wrk_raw=$(taskset -c "$PIN_LOADGEN" "$WRK_BIN" -t 4 -c "$conns" -d "${DURATION_SEC}s" --latency "$target_url" 2>&1 || true)
-    printf '%s\n' "$wrk_raw" > "$RESULTS_DIR/raw/${mode}_c${conns}_r${rep}.txt"
+    local raw_output="$RAW_DIR/${mode}_c${conns}_r${rep}.txt"
+    rm -f "$raw_output"
+    printf '%s\n' "$wrk_raw" > "$raw_output"
 
     local t1=$(date +%s%N)
     local elapsed_sec=$(awk -v t0="$t0" -v t1="$t1" 'BEGIN {printf "%.3f", (t1 - t0)/1000000000}')
@@ -252,7 +259,7 @@ run_benchmark_cell() {
     local err_write=$(echo "$parsed_metrics" | sed -n 's/.*socket_errors_write=\([0-9.]*\).*/\1/p')
     local err_timeout=$(echo "$parsed_metrics" | sed -n 's/.*socket_errors_timeout=\([0-9.]*\).*/\1/p')
     local non2xx=$(echo "$parsed_metrics" | sed -n 's/.*non_2xx=\([0-9.]*\).*/\1/p')
-    
+
     rps=${rps:-0.0}
     p50=${p50:-0.0}
     p75=${p75:-0.0}
@@ -303,6 +310,7 @@ main() {
 
     python3 - "$RESULTS_DIR/benchmark_manifest.json" "${MODES[@]}" <<'PY'
 import json, os, platform, subprocess, sys
+from pathlib import Path
 version = subprocess.run([os.environ.get("WRK_BIN", "wrk"), "--version"], text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.strip()
 version = version.splitlines()[0] if version else "unknown"
@@ -317,14 +325,19 @@ manifest = {
     "load_generator_cpu_set": os.environ.get("PIN_LOADGEN", "4-7"),
     "backend_cpu_set": os.environ.get("PIN_BACKENDS", "8-11"),
     "nginx_cpu_set": os.environ.get("PIN_NGINX", "0"),
+    "backend_targets": os.environ.get("LB_BACKENDS", "backend1:9001 backend2:9002 backend3:9003").split(),
+    "raw_output_directory": os.environ.get("RAW_DIR", "results/raw"),
     "wrk_version": version,
     "cpu_count": os.cpu_count(),
     "kernel_release": platform.release(),
     "platform": platform.platform(),
 }
-with open(sys.argv[1], "w") as output:
+manifest_path = Path(sys.argv[1])
+temporary_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+with temporary_path.open("w") as output:
     json.dump(manifest, output, indent=2)
     output.write("\n")
+temporary_path.replace(manifest_path)
 PY
 
     for conns in "${CONNS[@]}"; do

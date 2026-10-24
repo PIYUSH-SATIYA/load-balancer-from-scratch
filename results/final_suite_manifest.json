@@ -1,0 +1,23 @@
+{
+  "run_date": "2026-10-24",
+  "completed_suites": {
+    "idle": {
+      "hold_seconds": 5,
+      "epoll_targets": [10000, 20000, 30000],
+      "threaded_targets": [5000, 10000]
+    },
+    "failover_trials_per_mode": 20,
+    "algorithm_runs": 5,
+    "half_close_modes": ["threaded", "epoll"]
+  },
+  "throughput": {
+    "status": "short sweep completed",
+    "summary": "One 3-second measurement after a 1-second warmup at 50, 200, and 800 connections for direct-backend control, single-worker epoll, four-worker epoll, thread-per-connection, and four-core thread-per-connection. All 15 rows passed. Nginx was omitted because Docker and the Nginx service were unavailable.",
+    "repetitions": 1,
+    "warmup_seconds": 1,
+    "measurement_seconds": 3,
+    "concurrency_levels": [50, 200, 800],
+    "modes": ["Control", "Epoll_Optimized", "Epoll_4Workers", "Threaded_Proxy", "Threaded_4Cores"],
+    "nginx": "omitted: Docker daemon unavailable"
+  }
+}
