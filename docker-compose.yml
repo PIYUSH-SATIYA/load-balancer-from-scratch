@@ -20,8 +20,8 @@ services:
       - lbnet
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
+        soft: ${LB_NOFILE_LIMIT:-131072}
+        hard: ${LB_NOFILE_LIMIT:-131072}
     # Will run manually during dev
 
   nginx-comparison:

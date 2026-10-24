@@ -1,6 +1,6 @@
 # Benchmark report
 
-**Generated:** 2026-10-24 12:49 UTC<br>
+**Generated:** 2026-10-24 13:23 UTC<br>
 **Scope:** educational comparison of a small TCP proxy’s blocking and `epoll` implementations. These measurements do not claim production readiness or feature parity with NGINX/HAProxy.
 
 ## How to read this report
@@ -50,16 +50,16 @@ Settings: 5 repetitions; 2 s warmup; 5 s measured; concurrency 50, 100, 200, 400
 
 ## Idle connection capacity
 
-`bench/run_idle_test.sh` samples proxy process memory while the client still holds the established connections. `Established` is the number actually opened, not the requested target. Container cgroup memory includes the load generator as well as the proxy. `PASS` requires reaching the target and a successful active probe; `PARTIAL` means the target was not reached while the proxy remained responsive; `FAILED` means the proxy was absent or the active probe failed.
+`bench/run_idle_test.sh` measures the exact proxy PID before and during the hold. The client runs outside the proxy container, each cell uses fresh loopback source addresses to avoid earlier sockets in `TIME_WAIT`, and the harness records process threads, RSS, PSS, virtual size, file descriptors, open-file limits, client failures and proxy-container cgroup deltas. Host-mode cgroup fields are blank because the proxy and client share a host cgroup. `Established` is the actual number opened. `PASS` requires reaching the target and passing the active probe; `PARTIAL` means the target was missed while the probe worked; `FAILED` means the probe or proxy measurement failed. The per-connection PSS delta is process PSS growth divided by the established count, not total kernel memory per socket. A sampler issue is reported separately so resource exhaustion is not hidden as a proxy measurement.
 
-| Mode | Target | Established during hold | Handshake s | Connections/s | Threads | RSS MB | PSS MB | Cgroup MB | Active probe ms | Status |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| Epoll_Optimized | 10000 | 10000 | 1.44 | 6944 | 3 | 6.52 | 3.52 | 180.11 | 0.04 | PASS |
-| Threaded_Proxy | 10000 | 9265 | 13.47 | 688 | 3 | 17.79 | 14.80 | 26.14 | 0.00 | FAILED |
-| Epoll_Optimized | 20000 | 7344 | 32.05 | 229 | 3 | 5.80 | 2.85 | 140.41 | 0.00 | FAILED |
-| Threaded_Proxy | 20000 | 9265 | 6.07 | 1526 | 3 | 17.97 | 14.95 | 28.62 | 0.00 | FAILED |
-| Epoll_Optimized | 30000 | 10769 | 26.27 | 410 | 3 | 6.71 | 3.76 | 199.04 | 0.00 | FAILED |
-| Threaded_Proxy | 30000 | 9265 | 20.68 | 448 | 3 | 17.87 | 14.86 | 26.01 | 0.00 | FAILED |
+| Mode | Target | Established | Conn/s | Threads base→load | RSS base→load (Δ MB) | PSS base→load (Δ MB) | VmSize base→load (MB) | FDs base→load | PSS Δ/connection (KB) | Cgroup Δ MB | nofile soft/hard | Probe P50 ms | Client failures | Sampler issue | Status |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- | :--- |
+| Epoll_Optimized | 5000 | 5000 | 7623 | 3→3 | 4.41→5.59 (1.18) | 0.59→1.77 (1.18) | 87.33→88.50 | 5→10005 | 0.24 | — | 524288/524288 | 0.05 | {} |  | PASS |
+| Epoll_Optimized | 10000 | 10000 | 7538 | 3→3 | 4.44→6.77 (2.34) | 0.59→2.92 (2.33) | 87.33→89.56 | 5→20005 | 0.24 | — | 524288/524288 | 0.04 | {} |  | PASS |
+| Epoll_Optimized | 20000 | 20000 | 4109 | 3→3 | 4.44→9.07 (4.63) | 0.59→5.22 (4.63) | 87.33→91.93 | 5→40005 | 0.24 | — | 524288/524288 | 0.03 | {} |  | PASS |
+| Epoll_Optimized | 30000 | 30000 | 3401 | 3→3 | 4.44→11.54 (7.10) | 0.59→7.69 (7.10) | 87.33→94.34 | 5→60005 | 0.24 | — | 524288/524288 | 0.04 | {} |  | PASS |
+| Threaded_Proxy | 5000 | 5000 | 7323 | 3→10003 | 4.51→125.54 (121.04) | 0.60→121.63 (121.03) | 167.34→80784.33 | 4→10004 | 24.79 | — | 524288/524288 | 0.05 | {} |  | PASS |
+| Threaded_Proxy | 10000 | 9220 | 6458 | 3→18443 | 4.50→231.20 (226.70) | 0.59→227.20 (226.61) | 167.34→154574.28 | 4→18444 | 25.17 | — | 524288/524288 | 0.00 | {"IncompleteReadError:":780} |  | FAILED |
 
 ## Backend failure and recovery
 

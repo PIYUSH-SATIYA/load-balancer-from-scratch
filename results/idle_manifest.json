@@ -1,10 +1,27 @@
 {
   "hold_seconds": 5,
-  "targets": [
+  "epoll_targets": [
+    5000,
     10000,
     20000,
     30000
   ],
+  "threaded_targets": [
+    5000,
+    10000
+  ],
   "proxy_cpu": "0",
-  "platform": "Linux-7.2.9-arch1-1-x86_64-with-glibc2.44"
+  "platform": "Linux-7.2.9-arch1-1-x86_64-with-glibc2.44",
+  "proxy_container": false,
+  "client_location": "host",
+  "source_ips_rotated_per_cell": true,
+  "metrics": [
+    "process RSS",
+    "process PSS",
+    "process VmSize",
+    "process threads",
+    "process file descriptors",
+    "proxy cgroup memory and pids"
+  ],
+  "sampling_note": "The threaded 10000 target stopped at 9220 established; the prestarted sampler captured 18443 threads, 18444 FDs, 231.20 MB RSS, and 227.20 MB PSS. The row is FAILED because 780 client responses were incomplete and the active probe failed."
 }

@@ -477,3 +477,13 @@ The entries above are historical notes, not a verified statement that every plan
 - Docker was unavailable (`docker compose ps` could not connect to `/var/run/docker.sock`), so the 150-cell throughput sweep and idle sweep were not rerun in this session. The report marks the short-run limitations and the CPU metric as host pinned-set utilization.
 - Local research inputs in `papers/` are now ignored by Git and preserved on disk. Raw benchmark output remains versioned with the report as its evidence.
 
+### 2026-10-24: Corrected idle-capacity and process-memory comparison
+
+- The previous idle sweep reused the same source IP for successive cells and closed each cell's TCP sockets before starting the next. The client could therefore run into its own recently closed ports in `TIME_WAIT`; the old 20k/30k failures did not establish an epoll limit.
+- Reworked the sweep to rotate source IPs per cell, run the load client outside the proxy process/container, sample the exact proxy PID, and report RSS, PSS, VmSize, threads, FDs, nofile limits, client errors, and sampler errors. The Compose proxy nofile limit is configurable and defaults to 131072.
+- Five-second host-mode run: epoll established all 5k, 10k, 20k, and 30k targets. At 30k it used 3 threads and 60,005 FDs; RSS was 11.54 MB and PSS 7.69 MB (7.10 MB PSS growth from baseline).
+- At an equal 5k connection count, epoll PSS grew 1.18 MB; thread-per-connection PSS grew 121.03 MB and used 10,003 threads. The corresponding VmSize was about 88.5 MB for epoll and 80.8 GB for threaded, reflecting virtual thread-stack reservation rather than resident RAM.
+- The threaded 10k attempt established 9,217, had 783 incomplete/reset client responses, and failed the active probe. The monitor could not fork under resource exhaustion, so no load memory/thread snapshot is claimed for that row.
+- Corrected the epoll implementation to handle client registration and event-update failures instead of silently leaving sockets unmonitored. Host CMake build, smoke benchmark, report generation, shell syntax, Python compilation, and `git diff --check` passed. Docker was unavailable, so these new idle measurements ran on the host; host cgroup memory is therefore left blank.
+- Follow-up with the sampler prestarted before connection creation reached 9,220/10,000 threaded connections. It captured 18,443 threads, 18,444 FDs, 231.20 MB RSS and 227.20 MB PSS; 780 client responses were incomplete and the active probe failed. The row now contains this observed resource snapshot and is marked `FAILED` because the active probe failed.
+

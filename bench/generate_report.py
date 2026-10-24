@@ -71,10 +71,37 @@ def idle_section():
         rows = list(csv.DictReader(handle))
     if not rows:
         return "No idle-sweep rows were recorded."
-    out = ["| Mode | Target | Established during hold | Handshake s | Connections/s | Threads | RSS MB | PSS MB | Cgroup MB | Active probe ms | Status |",
-           "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |"]
+    if "ThreadsLoad" not in rows[0]:
+        return ("The available CSV uses the previous idle harness. Its thread counts are inconsistent with the thread-per-connection implementation, "
+                "so those rows are retained as historical data but are not used to claim a memory or connection-capacity comparison. Rerun `bench/run_idle_test.sh`.")
+    out = ["| Mode | Target | Established | Conn/s | Threads base→load | RSS base→load (Δ MB) | PSS base→load (Δ MB) | VmSize base→load (MB) | FDs base→load | PSS Δ/connection (KB) | Cgroup Δ MB | nofile soft/hard | Probe P50 ms | Client failures | Sampler issue | Status |",
+           "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- | :--- |"]
     for row in rows:
-        out.append("| {Architecture} | {TargetConns} | {EstablishedConns} | {HandshakeSec} | {ConnRate} | {Threads} | {RSS_MB} | {PSS_MB} | {Cgroup_MB} | {ActiveLatency_ms} | {Status} |".format(**row))
+        try:
+            established = int(row["EstablishedConns"])
+            pss_delta_kb = float(row["PSSDeltaMB"]) * 1024
+            per_connection = f"{pss_delta_kb / established:.2f}" if established else "—"
+        except (KeyError, ValueError, ZeroDivisionError):
+            per_connection = "—"
+        def pair(before, after, delta=None):
+            a, b = row.get(before, ""), row.get(after, "")
+            value = f"{a}→{b}"
+            if delta and row.get(delta, ""):
+                value += f" ({row[delta]})"
+            return value
+        cgroup_delta = row.get("CgroupDeltaMB") or "—"
+        nofile = f"{row.get('NofileSoft')}/{row.get('NofileHard')}" if row.get("NofileSoft") and row.get("NofileHard") else "—"
+        out.append("| {Architecture} | {TargetConns} | {EstablishedConns} | {ConnRate} | {threads} | {rss} | {pss} | {vms} | {fds} | {per_connection} | {cgroup_delta} | {nofile} | {ActiveLatencyP50ms} | {ClientFailures} | {SamplerError} | {Status} |".format(
+            **row,
+            threads=pair("ThreadsBaseline", "ThreadsLoad"),
+            rss=pair("RSSBaselineMB", "RSSLoadMB", "RSSDeltaMB"),
+            pss=pair("PSSBaselineMB", "PSSLoadMB", "PSSDeltaMB"),
+            vms=pair("VmSizeBaselineMB", "VmSizeLoadMB"),
+            fds=pair("FdsBaseline", "FdsLoad"),
+            per_connection=per_connection,
+            cgroup_delta=cgroup_delta,
+            nofile=nofile,
+        ))
     return "\n".join(out)
 
 
@@ -180,7 +207,7 @@ Every table below is generated from the current files in `results/`. The CSV and
 
 ## Idle connection capacity
 
-`bench/run_idle_test.sh` samples proxy process memory while the client still holds the established connections. `Established` is the number actually opened, not the requested target. Container cgroup memory includes the load generator as well as the proxy. `PASS` requires reaching the target and a successful active probe; `PARTIAL` means the target was not reached while the proxy remained responsive; `FAILED` means the proxy was absent or the active probe failed.
+`bench/run_idle_test.sh` measures the exact proxy PID before and during the hold. The client runs outside the proxy container, each cell uses fresh loopback source addresses to avoid earlier sockets in `TIME_WAIT`, and the harness records process threads, RSS, PSS, virtual size, file descriptors, open-file limits, client failures and proxy-container cgroup deltas. Host-mode cgroup fields are blank because the proxy and client share a host cgroup. `Established` is the actual number opened. `PASS` requires reaching the target and passing the active probe; `PARTIAL` means the target was missed while the probe worked; `FAILED` means the probe or proxy measurement failed. The per-connection PSS delta is process PSS growth divided by the established count, not total kernel memory per socket. A sampler issue is reported separately so resource exhaustion is not hidden as a proxy measurement.
 
 {idle_section()}
 

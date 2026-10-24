@@ -24,11 +24,15 @@ bool EpollCore::set_non_blocking(int fd) {
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-void EpollCore::update_epoll(int fd, uint32_t events) {
-    struct epoll_event ev;
+bool EpollCore::update_epoll(int fd, uint32_t events) {
+    struct epoll_event ev{};
     ev.events = events;
     ev.data.fd = fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        LOG_ERROR("epoll_ctl MOD failed for fd " << fd << ": " << strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 void EpollCore::remove_epoll(int fd) {
@@ -45,7 +49,10 @@ void EpollCore::update_session_epoll(std::shared_ptr<Session> session) {
         if (session->b2c_buffer && !session->b2c_buffer->empty()) c_events |= EPOLLOUT;
         
         if (c_events != session->client_events) {
-            update_epoll(session->client_fd, c_events);
+            if (!update_epoll(session->client_fd, c_events)) {
+                close_session(session);
+                return;
+            }
             session->client_events = c_events;
         }
     }
@@ -56,7 +63,10 @@ void EpollCore::update_session_epoll(std::shared_ptr<Session> session) {
         if ((!session->backend_connected) || (session->c2b_buffer && !session->c2b_buffer->empty())) b_events |= EPOLLOUT;
 
         if (b_events != session->backend_events) {
-            update_epoll(session->backend_fd, b_events);
+            if (!update_epoll(session->backend_fd, b_events)) {
+                close_session(session);
+                return;
+            }
             session->backend_events = b_events;
         }
     }
@@ -365,7 +375,11 @@ void EpollCore::handle_new_connection() {
         struct epoll_event ev_c;
         ev_c.events = EPOLLIN;
         ev_c.data.fd = client_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev_c);
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev_c) < 0) {
+            LOG_WARN("Failed to register client socket " << client_fd << " with epoll: " << strerror(errno));
+            close_session(session);
+            continue;
+        }
 
         if (!connect_session_backend(session)) {
             close_session(session);

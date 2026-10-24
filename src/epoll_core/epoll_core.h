@@ -75,7 +75,7 @@ private:
     std::unordered_set<std::shared_ptr<Session>> pending_connects;
 
     bool set_non_blocking(int fd);
-    void update_epoll(int fd, uint32_t events);
+    bool update_epoll(int fd, uint32_t events);
     void remove_epoll(int fd);
     
     void update_session_epoll(std::shared_ptr<Session> session);
