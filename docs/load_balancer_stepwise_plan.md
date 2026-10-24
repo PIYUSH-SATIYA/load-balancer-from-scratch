@@ -1,13 +1,13 @@
-# Load Balancer — Incremental Build Plan (first-timer pace)
+# TCP Proxy — Systems Learning Plan
 
-**Approach: incremental, phase-gated.** Each step below must produce something you can *run and demo* before you move to the next. Never start step N+1 with step N half-working — that's how bugs from two different layers get confused with each other.
+**Approach: incremental experiments.** The steps introduce sockets, routing, connection lifecycles, and concurrency models in a sequence that makes each behavior easier to inspect.
 
 ---
 
 ## Step 0 — Environment + "hello socket" (budget: 1–2 sessions)
 
 **Do:**
-1. Confirm a Linux ekvironment (native or WSL2) with g++/clang and `make` or `cmake` working.
+1. Confirm a Linux environment (native or WSL2) with g++/clang and `make` or `cmake` working.
 2. Read Beej's Guide to Network Programming — just the sections on TCP client and TCP server (skip UDP, skip advanced sections for now).
 3. Write two tiny programs by hand, not copy-pasted: a server that `socket()` → `bind()` → `listen()` → `accept()`s one connection and prints what it receives, and a client that `socket()` → `connect()`s and sends one string.
 
@@ -47,7 +47,7 @@
 
 **Do:**
 1. Add a minimal config (command-line flags are enough — backend list, algorithm choice).
-2. Add basic stats: requests routed per backend, printed on exit or on a signal.
+2. Add basic backend-selection stats, printed on exit or on a signal.
 
 **Done when:** you can change the backend list or algorithm without recompiling.
 
@@ -74,7 +74,7 @@
 1. Before writing code: find a visual "consistent hashing explained" blog post (not the original paper yet) and actually work through the ring diagram on paper.
 2. Implement: hash backend IDs onto a numeric ring, hash the incoming client IP the same way, route to the next backend clockwise on the ring.
 
-**Done when:** the same client IP consistently lands on the same backend across multiple connections, and adding/removing a backend only reshuffles a small fraction of existing mappings (verify this by printing before/after routing tables).
+**Done when:** the same client IP consistently lands on the same backend across multiple connections. Measuring remapping after changing the backend set is an optional follow-up experiment.
 
 ---
 
@@ -87,7 +87,7 @@
 
 **Done when:** you can kill a backend process mid-test, watch traffic stop routing to it within ~N seconds, then restart it and watch traffic resume.
 
-**This is your demo moment** — the proposal's "deliverable" list explicitly calls out a live deliberate-failure demo. Make sure this step is rock solid, not just "works once."
+This is a useful live exercise: stop a backend, observe health state and request failures, then restart it and watch routing resume.
 
 ---
 
@@ -97,29 +97,29 @@
 
 **Do:**
 1. Rewrite the connection handler as a single-threaded event loop: register client and backend sockets with `epoll`, loop on `epoll_wait`, only read/write sockets that are actually ready.
-2. Keep your thread-per-connection version in a separate branch — don't delete it. If epoll runs out of time, you demo the working version instead of a broken one.
+2. Keep the thread-per-connection implementation beside the `epoll` implementation so the two relay models can be compared.
 
 **Done when:** epoll version passes the same manual tests as Step 1–2, and you can show it handling more concurrent connections without spawning more threads (a simple `wrk -c 500` vs `wrk -c 5000` comparison against thread count is a good demo).
 
-**If you're tight on time:** this is the step to cut or timebox hardest. A correct, well-tested thread-per-connection LB with all 3 algorithms and health checks is a complete, gradeable project on its own. An unfinished, buggy epoll rewrite is worse than not attempting it.
+**Learning note:** Compare thread count, memory, connection capacity, and latency on the same host.
 
 ---
 
-## Step 8 — Benchmark harness + nginx comparison (budget: 2–3 sessions, start in parallel with Step 6 if possible)
+## Step 8 — Benchmark harness + NGINX reference (budget: 2–3 sessions)
 
 **Do:**
-1. Configure nginx's `upstream` module with the *identical* backend pool, same algorithm (round robin, since both support it natively) — freeze this config before testing either system.
-2. Write `wrk`-driving scripts that hit both, discarding a warm-up period, and record p50/p95/p99 latency plus throughput.
+1. Configure NGINX with the same backend pool and round-robin behavior for a limited throughput reference.
+2. Write `wrk`-driving scripts that discard a warm-up period and record emitted latency percentiles plus throughput.
 3. Raise `ulimit -n` before any load test, or your concurrency numbers will be artificially capped.
-4. Deliberately kill a backend mid-benchmark run for both systems and measure failover recovery time.
+4. Separately stop and restart a backend during proxy traffic; record failed probes and the first probe routed back to the recovered backend.
 
-**Done when:** you have real numbers/graphs for both systems under identical conditions — this is your project's actual empirical contribution, per your reframing with the professor.
+**Done when:** the run settings, CSV/JSON trial data, and limits of the local measurements are documented. This is an educational comparison, not a claim of equivalence between systems.
 
 ---
 
 ## Step 9 — Report + polish (budget: 1–2 sessions)
 
-**Do:** Write up methodology, raw data, and an honest discussion of *why* your numbers differ from nginx's — not just that they differ. This "why" is the difference between a demo and a result.
+**Do:** Write up the method, raw data, and what the results can and cannot say about these implementations on this host.
 
 ---
 

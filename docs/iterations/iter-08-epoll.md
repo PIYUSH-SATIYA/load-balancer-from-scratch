@@ -1,7 +1,7 @@
 # Iteration 8: Epoll Event Loop (The C10k Problem)
 
 ## Objective
-Replace the multi-threaded proxy engine with a high-performance, single-threaded asynchronous Event Loop using Linux's `epoll` API. This is the exact architecture used by Nginx, Redis, and Node.js to handle tens of thousands of concurrent connections (the C10k problem) without crashing the kernel.
+Add a second proxy engine using Linux `epoll`, then compare its connection lifecycle and resource use with the blocking version. This is an educational event-loop implementation; it is not an attempt to reproduce another server's full architecture.
 
 ## Key Changes & Why They Matter
 
@@ -21,14 +21,13 @@ In a single-threaded event loop, the thread rapidly jumps between handling 10,00
 ### 4. Toggling `EPOLLOUT`
 We always listen for `EPOLLIN` (data available to read). But we only listen for `EPOLLOUT` (socket ready to be written to) if our buffer actually has data in it! If we listened for `EPOLLOUT` when our buffer was empty, `epoll_wait` would immediately wake up repeatedly (spinning the CPU to 100%) because the socket is practically *always* ready to be written to.
 
-## How to Verify This Iteration
+## How to Run This Iteration
 
 We kept both architectures! You can toggle between them using the `-e` flag.
 
-Run the new high-performance core:
+Run the event-loop core:
 ```bash
 docker compose exec loadbalancer /app/build/loadbalancer -a round_robin -e
 ```
 
-Open some connections, verify they still route perfectly. 
-In the final step of this project, we will benchmark the Threaded Core vs the Epoll Core using a load testing tool to prove that Epoll absolutely destroys the threaded model under heavy concurrency!
+Open a connection and send a request through the proxy. The benchmark suite can compare the two modes on this host; its measured results and limitations are in [`benchmark_report.md`](../benchmark_report.md).

@@ -58,7 +58,7 @@ Backend* ConsistentHashing::select_backend(std::vector<Backend>& backends, const
     if (selected.status == BackendStatus::DOWN) {
         return nullptr;
     }
-    selected.total_requests.fetch_add(1);
+    selected.backend_selections.fetch_add(1);
     
     return &selected;
 }

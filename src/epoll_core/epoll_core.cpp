@@ -8,23 +8,20 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <cstring>
-#include <signal.h>
 
 #define MAX_EVENTS 1024
 
 EpollCore::EpollCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm, bool passive_failover)
-    : listening_port(port), backends(backends), algorithm(algorithm), passive_failover(passive_failover), server_fd(-1), epoll_fd(-1) {
-    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE on broken sockets
-}
+    : listening_port(port), backends(backends), algorithm(algorithm), passive_failover(passive_failover), server_fd(-1), epoll_fd(-1) {}
 
 EpollCore::~EpollCore() {
     if (server_fd >= 0) close(server_fd);
     if (epoll_fd >= 0) close(epoll_fd);
 }
 
-void EpollCore::set_non_blocking(int fd) {
+bool EpollCore::set_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
 void EpollCore::update_epoll(int fd, uint32_t events) {
@@ -79,10 +76,17 @@ void EpollCore::check_session_done(std::shared_ptr<Session> session) {
 
 void EpollCore::start() {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        LOG_ERROR("Failed to create listening socket: " << strerror(errno));
+        return;
+    }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    set_non_blocking(server_fd);
+    if (!set_non_blocking(server_fd)) {
+        LOG_ERROR("Failed to make listening socket nonblocking: " << strerror(errno));
+        return;
+    }
 
     struct sockaddr_in address;
     address.sin_family = AF_INET;
@@ -94,13 +98,23 @@ void EpollCore::start() {
         return;
     }
 
-    listen(server_fd, SOMAXCONN);
+    if (listen(server_fd, SOMAXCONN) < 0) {
+        LOG_ERROR("Listen failed: " << strerror(errno));
+        return;
+    }
 
     epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        LOG_ERROR("epoll_create1 failed: " << strerror(errno));
+        return;
+    }
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        LOG_ERROR("Failed to register listening socket: " << strerror(errno));
+        return;
+    }
 
     LOG_INFO("EpollCore proxy listening on port " << listening_port << " (Passive Failover: " << (passive_failover ? "ON" : "OFF") << ")...");
 
@@ -128,7 +142,9 @@ void EpollCore::start() {
             if (fd == session->backend_fd && !session->backend_connected) {
                 int so_error = 0;
                 socklen_t len = sizeof(so_error);
-                if (getsockopt(session->backend_fd, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 && so_error == 0) {
+                const int socket_error = getsockopt(session->backend_fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+                if (socket_error < 0) so_error = errno;
+                if (socket_error == 0 && so_error == 0) {
                     session->backend_connected = true;
                     pending_connects.erase(session);
                     // Forward any buffered client request that arrived during connect
@@ -137,12 +153,13 @@ void EpollCore::start() {
                         if (sent > 0) {
                             session->c2b_buffer->consume(sent);
                             if (session->c2b_buffer->empty()) session->c2b_buffer.reset();
-                        } else if (sent < 0 && errno != EAGAIN) {
+                        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             close_session(session);
                             continue;
                         }
                     }
-                    if (session->client_read_closed) {
+                    if (session->client_read_closed &&
+                        (!session->c2b_buffer || session->c2b_buffer->empty())) {
                         shutdown(session->backend_fd, SHUT_WR);
                     }
                     update_session_epoll(session);
@@ -168,18 +185,6 @@ void EpollCore::start() {
             if (revents & EPOLLERR) {
                 close_session(session);
                 continue;
-            }
-
-            if (revents & EPOLLHUP) {
-                // Peer closed write channel; mark closed and drain remaining buffers
-                if (fd == session->client_fd) {
-                    session->client_read_closed = true;
-                } else {
-                    session->backend_read_closed = true;
-                }
-                update_session_epoll(session);
-                check_session_done(session);
-                if (session->fully_closed) continue;
             }
 
             if (fd == session->client_fd) {
@@ -252,9 +257,12 @@ bool EpollCore::connect_session_backend(std::shared_ptr<Session> session) {
         if (backend_fd < 0) {
             return false;
         }
-        set_non_blocking(backend_fd);
+        if (!set_non_blocking(backend_fd)) {
+            close(backend_fd);
+            return false;
+        }
 
-        if (!selected->addr_resolved) {
+        if (!selected->addr_resolved.load()) {
             if (!selected->resolve_address()) {
                 close(backend_fd);
                 if (passive_failover) {
@@ -289,7 +297,15 @@ bool EpollCore::connect_session_backend(std::shared_ptr<Session> session) {
         struct epoll_event ev_b;
         ev_b.events = EPOLLIN | EPOLLOUT;
         ev_b.data.fd = backend_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, backend_fd, &ev_b);
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, backend_fd, &ev_b) < 0) {
+            sessions.erase(backend_fd);
+            close(backend_fd);
+            session->backend_fd = -1;
+            selected->active_connections.fetch_sub(1);
+            session->backend_node = nullptr;
+            if (passive_failover) continue;
+            return false;
+        }
 
         if (conn_res == 0) {
             session->backend_connected = true;
@@ -323,8 +339,16 @@ void EpollCore::handle_new_connection() {
             break;
         }
 
-        set_non_blocking(client_fd);
-        std::string client_ip = inet_ntoa(client_addr.sin_addr);
+        if (!set_non_blocking(client_fd)) {
+            close(client_fd);
+            continue;
+        }
+        char client_ip_buffer[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_buffer, sizeof(client_ip_buffer)) == nullptr) {
+            close(client_fd);
+            continue;
+        }
+        std::string client_ip = client_ip_buffer;
 
         auto session = std::make_shared<Session>();
         session->client_fd = client_fd;
@@ -369,15 +393,16 @@ void EpollCore::handle_client_read(std::shared_ptr<Session> session) {
             if (sent > 0) {
                 session->c2b_buffer->consume(sent);
                 if (session->c2b_buffer->empty()) session->c2b_buffer.reset(); // Free 16KB on-demand
-            } else if (sent < 0 && errno != EAGAIN) {
+            } else if (sent == 0 || (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
                 close_session(session);
                 return;
             }
             update_session_epoll(session);
         }
-    } else if (n == 0 || (n < 0 && errno != EAGAIN)) {
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         session->client_read_closed = true;
-        if (session->backend_connected && session->backend_fd >= 0) {
+        if (session->backend_connected && session->backend_fd >= 0 &&
+            (!session->c2b_buffer || session->c2b_buffer->empty())) {
             shutdown(session->backend_fd, SHUT_WR); // TCP Half-Close
         }
         update_session_epoll(session);
@@ -388,16 +413,20 @@ void EpollCore::handle_client_read(std::shared_ptr<Session> session) {
 void EpollCore::handle_client_write(std::shared_ptr<Session> session) {
     if (!session->b2c_buffer || session->b2c_buffer->empty()) {
         if (session->b2c_buffer && session->b2c_buffer->empty()) session->b2c_buffer.reset();
+        if (session->backend_read_closed && session->client_fd >= 0) shutdown(session->client_fd, SHUT_WR);
         update_session_epoll(session);
         return;
     }
     ssize_t n = send(session->client_fd, session->b2c_buffer->data + session->b2c_buffer->head, session->b2c_buffer->length(), 0);
     if (n > 0) {
         session->b2c_buffer->consume(n);
-        if (session->b2c_buffer->empty()) session->b2c_buffer.reset();
+        if (session->b2c_buffer->empty()) {
+            session->b2c_buffer.reset();
+            if (session->backend_read_closed) shutdown(session->client_fd, SHUT_WR);
+        }
         update_session_epoll(session);
         check_session_done(session);
-    } else if (n < 0 && errno != EAGAIN) {
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         close_session(session);
     }
 }
@@ -420,14 +449,16 @@ void EpollCore::handle_backend_read(std::shared_ptr<Session> session) {
         if (sent > 0) {
             session->b2c_buffer->consume(sent);
             if (session->b2c_buffer->empty()) session->b2c_buffer.reset(); // Free 16KB on-demand
-        } else if (sent < 0 && errno != EAGAIN) {
+        } else if (sent == 0 || (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
             close_session(session);
             return;
         }
         update_session_epoll(session);
-    } else if (n == 0 || (n < 0 && errno != EAGAIN)) {
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         session->backend_read_closed = true;
-        shutdown(session->client_fd, SHUT_WR); // TCP Half-Close: Tell client we are done sending
+        if (!session->b2c_buffer || session->b2c_buffer->empty()) {
+            shutdown(session->client_fd, SHUT_WR); // TCP Half-Close: Tell client we are done sending
+        }
         update_session_epoll(session);
         check_session_done(session);
     }
@@ -436,22 +467,28 @@ void EpollCore::handle_backend_read(std::shared_ptr<Session> session) {
 void EpollCore::handle_backend_write(std::shared_ptr<Session> session) {
     if (!session->c2b_buffer || session->c2b_buffer->empty()) {
         if (session->c2b_buffer && session->c2b_buffer->empty()) session->c2b_buffer.reset();
+        if (session->client_read_closed && session->backend_fd >= 0) shutdown(session->backend_fd, SHUT_WR);
         update_session_epoll(session);
         return;
     }
     ssize_t n = send(session->backend_fd, session->c2b_buffer->data + session->c2b_buffer->head, session->c2b_buffer->length(), 0);
     if (n > 0) {
         session->c2b_buffer->consume(n);
-        if (session->c2b_buffer->empty()) session->c2b_buffer.reset();
+        if (session->c2b_buffer->empty()) {
+            session->c2b_buffer.reset();
+            if (session->client_read_closed) shutdown(session->backend_fd, SHUT_WR);
+        }
         update_session_epoll(session);
         check_session_done(session);
-    } else if (n < 0 && errno != EAGAIN) {
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         close_session(session);
     }
 }
 
 void EpollCore::close_session(std::shared_ptr<Session> session) {
     if (session->fully_closed) return;
+
+    pending_connects.erase(session);
 
     if (session->backend_node) {
         session->backend_node->active_connections.fetch_sub(1);

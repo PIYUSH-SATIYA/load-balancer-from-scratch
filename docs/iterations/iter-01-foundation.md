@@ -14,7 +14,7 @@ We've split the `Dockerfile` into three stages:
 * **`build`**: Takes the `dev` stage, copies the source code, and performs a release build.
 * **`prod`**: A clean, minimal image that only contains the compiled binaries (`loadbalancer` and `dummy_backend`), leaving behind compilers and tools.
 
-*Why:* In dev, we want to edit code on our host and compile inside the container without rebuilding the image every time. In production (or benchmarking), we want a lean, immutable image.
+*Why:* In development and benchmarking, we want to edit code on the host and compile inside the container without rebuilding the image every time. This learning project has no production image target.
 
 ### 2. Hardened CMakeLists.txt
 

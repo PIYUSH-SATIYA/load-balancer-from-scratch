@@ -1,11 +1,26 @@
 services:
-  loadbalancer:
-    network_mode: "host"
-    ports: []          # must explicitly clear — host mode + ports: together is invalid
-  nginx-comparison:
-    network_mode: "host"
-    ports: []
   bench:
-    build: .
-    network_mode: "host"
-    command: ["./bench/run_bench.sh"]
+    image: load-balancer-from-scratch:dev
+    build:
+      context: .
+      target: dev
+    working_dir: /app
+    volumes:
+      - .:/app
+      - build_cache:/app/build
+    command: ["bash", "-lc", "cmake --build /app/build && ./bench/run_bench.sh"]
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
+      nginx-comparison:
+        condition: service_started
+    networks:
+      - lbnet
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

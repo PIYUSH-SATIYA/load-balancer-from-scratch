@@ -2,14 +2,16 @@
 FROM ubuntu:24.04 AS dev
 
 RUN apt-get update && apt-get install -y \
-    build-essential cmake git \
-    libssl-dev unzip libpcre3-dev zlib1g-dev \
+    build-essential cmake git ca-certificates \
     netcat-openbsd curl iproute2 python3 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y unzip \
+    && rm -rf /var/lib/apt/lists/*
+
 # wrk isn't in Ubuntu's default repos — build it once, bake into image
-RUN git clone https://github.com/wg/wrk.git /tmp/wrk \
-    && cd /tmp/wrk && make && cp wrk /usr/local/bin/ \
+RUN git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk \
+    && cd /tmp/wrk && make -j"$(nproc)" && cp wrk /usr/local/bin/ \
     && rm -rf /tmp/wrk
 
 WORKDIR /app
@@ -21,9 +23,3 @@ CMD ["sleep", "infinity"]
 FROM dev AS build
 COPY . /app
 RUN mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-
-# === Stage 3: Production (Lean) ===
-FROM ubuntu:24.04 AS prod
-COPY --from=build /app/build/loadbalancer /usr/local/bin/
-COPY --from=build /app/build/dummy_backend /usr/local/bin/
-CMD ["loadbalancer"]

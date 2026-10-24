@@ -7,12 +7,11 @@
 
 struct ConnectionTracker {
     Backend* backend;
-    ConnectionTracker(Backend* b) : backend(b) {}
-    ~ConnectionTracker() { 
-        if (backend) {
-            backend->active_connections.fetch_sub(1); 
-        }
-    }
+    int client_fd;
+    int backend_fd;
+    ConnectionTracker(Backend* b, int client, int upstream)
+        : backend(b), client_fd(client), backend_fd(upstream) {}
+    ~ConnectionTracker();
 };
 
 class ProxyCore {

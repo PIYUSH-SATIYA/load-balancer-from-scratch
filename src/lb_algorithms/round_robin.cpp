@@ -16,7 +16,7 @@ Backend* RoundRobin::select_backend(std::vector<Backend>& backends, const std::s
         
         // If it's UP, we found our target!
         if (selected.status.load() == BackendStatus::UP) {
-            selected.total_requests.fetch_add(1);
+            selected.backend_selections.fetch_add(1);
             return &selected;
         }
         // If DOWN, the loop continues and it grabs the next one

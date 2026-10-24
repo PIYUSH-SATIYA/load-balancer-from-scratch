@@ -8,15 +8,18 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <cstring>
-#include <signal.h>
+#include <fcntl.h>
+#include <poll.h>
+
+ConnectionTracker::~ConnectionTracker() {
+    if (client_fd >= 0) close(client_fd);
+    if (backend_fd >= 0) close(backend_fd);
+    if (backend) backend->active_connections.fetch_sub(1);
+}
 
 ProxyCore::ProxyCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm, bool passive_failover) 
     : listening_port(port), backends(backends), algorithm(algorithm), passive_failover(passive_failover), server_fd(-1) {
     
-    // Suppress SIGPIPE. If we write to a socket that the other end has closed,
-    // the OS sends SIGPIPE which kills the process by default. We want send() 
-    // to just return -1 with errno=EPIPE instead.
-    signal(SIGPIPE, SIG_IGN);
 }
 
 ProxyCore::~ProxyCore() {
@@ -86,7 +89,7 @@ void ProxyCore::start() {
                     backend_fd = socket(AF_INET, SOCK_STREAM, 0);
                     if (backend_fd < 0) break;
 
-                    if (!selected_backend->addr_resolved) {
+                    if (!selected_backend->addr_resolved.load()) {
                         if (!selected_backend->resolve_address()) {
                             close(backend_fd);
                             backend_fd = -1;
@@ -99,12 +102,37 @@ void ProxyCore::start() {
                         }
                     }
 
-                    if (connect(backend_fd, (struct sockaddr*)&selected_backend->addr, sizeof(selected_backend->addr)) < 0) {
+                    const int old_flags = fcntl(backend_fd, F_GETFL, 0);
+                    bool connected = old_flags >= 0 && fcntl(backend_fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+                    int connect_error = connected ? 0 : errno;
+                    if (connected && connect(backend_fd, (struct sockaddr*)&selected_backend->addr,
+                                             sizeof(selected_backend->addr)) < 0) {
+                        if (errno == EINPROGRESS) {
+                            pollfd event{backend_fd, POLLOUT, 0};
+                            int ready;
+                            do { ready = poll(&event, 1, 250); } while (ready < 0 && errno == EINTR);
+                            socklen_t error_size = sizeof(connect_error);
+                            if (ready > 0 && getsockopt(backend_fd, SOL_SOCKET, SO_ERROR,
+                                                        &connect_error, &error_size) == 0) {
+                                connected = connect_error == 0;
+                            } else {
+                                connect_error = ready == 0 ? ETIMEDOUT : errno;
+                            }
+                        } else {
+                            connect_error = errno;
+                            connected = false;
+                        }
+                    }
+                    if (connected && fcntl(backend_fd, F_SETFL, old_flags) < 0) {
+                        connect_error = errno;
+                        connected = false;
+                    }
+                    if (!connected) {
                         close(backend_fd);
                         backend_fd = -1;
                         if (passive_failover) {
                             selected_backend->status.store(BackendStatus::DOWN);
-                            LOG_WARN("PassiveFailover (ProxyCore): Backend " << selected_backend->ip << ":" << selected_backend->port << " failed to connect (" << strerror(errno) << "), marking DOWN and retrying next backend.");
+                            LOG_WARN("PassiveFailover (ProxyCore): Backend " << selected_backend->ip << ":" << selected_backend->port << " failed to connect (" << strerror(connect_error) << "), marking DOWN and retrying next backend.");
                             continue;
                         }
                         break;
@@ -120,15 +148,14 @@ void ProxyCore::start() {
                 }
 
                 selected_backend->active_connections.fetch_add(1);
-                auto tracker = std::make_shared<ConnectionTracker>(selected_backend);
+                auto tracker = std::make_shared<ConnectionTracker>(selected_backend, client_fd, backend_fd);
 
                 // Spawn second relay thread for backend->client, and use this current thread for client->backend
                 try {
                     std::thread(relay_traffic, backend_fd, client_fd, tracker).detach();
                     relay_traffic(client_fd, backend_fd, tracker);
                 } catch (const std::system_error& e) {
-                    close(client_fd);
-                    close(backend_fd);
+                    (void)e; // tracker owns descriptor cleanup and accounting
                 }
             }).detach();
         } catch (const std::system_error& e) {
@@ -137,8 +164,9 @@ void ProxyCore::start() {
     }
 }
 
-void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<ConnectionTracker> /*tracker*/) {
+void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<ConnectionTracker> tracker) {
     char buffer[8192];
+    bool fatal = false;
     
     while (true) {
         // Read from source
@@ -148,8 +176,11 @@ void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<Connection
         if (bytes_read == 0) {
             // recv() returns exactly 0 when the peer performs an orderly shutdown (TCP FIN).
             break;
+        } else if (bytes_read < 0 && errno == EINTR) {
+            continue;
         } else if (bytes_read < 0) {
             // recv() returns -1 on an error.
+            fatal = true;
             break;
         }
 
@@ -157,7 +188,9 @@ void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<Connection
         ssize_t bytes_sent = 0;
         while (bytes_sent < bytes_read) {
             ssize_t result = send(to_fd, buffer + bytes_sent, bytes_read - bytes_sent, 0);
-            if (result < 0) {
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) {
+                fatal = true;
                 goto end_relay; // Break out of both loops
             }
             bytes_sent += result;
@@ -170,9 +203,11 @@ end_relay:
     // recv() call on another thread! The other thread will hang forever.
     // shutdown() operates on the underlying socket object and forcefully unblocks 
     // any pending recv() or send() calls, ensuring the opposite thread wakes up and exits.
-    shutdown(from_fd, SHUT_RDWR);
-    shutdown(to_fd, SHUT_RDWR);
-    
-    close(from_fd);
-    close(to_fd);
+    if (fatal) {
+        shutdown(from_fd, SHUT_RDWR);
+        shutdown(to_fd, SHUT_RDWR);
+    } else {
+        shutdown(to_fd, SHUT_WR);
+    }
+    (void)tracker; // Retain ownership until both relay directions have finished.
 }

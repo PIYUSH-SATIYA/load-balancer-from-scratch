@@ -1,209 +1,220 @@
 #!/usr/bin/env python3
+"""Measure request loss while one local backend is killed and restarted.
+
+The harness runs without Docker, owns every child process it starts, saves raw
+trial timestamps/results as JSON, and returns failure if the requested sample
+count or request outcomes cannot be measured.
 """
-High-Availability Failover & Recovery Benchmark Suite.
-Executes 20 consecutive automated Monte Carlo trials:
-  - Streams continuous concurrent HTTP requests at 20 req/s using asyncio
-  - Injects SIGKILL fault into backend2 at randomized offsets
-  - Evaluates both Active-Only failover (-F) and Passive Failover modes
-  - Measures failure convergence duration, dropped requests, and recovery restoration
-  - Computes audit-grade statistical distribution (Min, Median, Mean ± StdDev, Max)
-"""
-import sys
-import os
-import time
-import random
+import argparse
 import asyncio
+import json
+import os
+import random
+import re
+import signal
+import socket
 import subprocess
-from typing import Dict, List, Tuple, Any
+import time
+from pathlib import Path
 
-# Add bench directory to path for bench.lib.stats
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT))
 from bench.lib.stats import compute_stats, format_stats
+BACKEND_PORTS = (9001, 9002, 9003)
 
-def run_cmd(cmd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-async def send_single_probe(session_idx: int, target_url: str, timeout: float = 1.0) -> Tuple[int, float, bool, str, float]:
-    """
-    Sends a single HTTP GET probe.
-    Returns: (session_idx, send_timestamp, success, error_message, latency_ms)
-    """
-    host = "127.0.0.1"
-    port = 8080
-    t0 = time.time()
-    try:
-        # Use low-level asyncio TCP socket stream for zero-overhead non-blocking I/O
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-        req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        writer.write(req)
-        await writer.drain()
-        resp = await asyncio.wait_for(reader.read(512), timeout=timeout)
-        writer.close()
-        await writer.wait_closed()
-
-        lat_ms = (time.time() - t0) * 1000.0
-        success = b"200 OK" in resp
-        err = "" if success else "Non-200 Response"
-        return (session_idx, t0, success, err, lat_ms)
-    except Exception as e:
-        lat_ms = (time.time() - t0) * 1000.0
-        return (session_idx, t0, False, str(e), lat_ms)
-
-async def stream_probes(target_url: str, rate_per_sec: int, duration_sec: float) -> List[Tuple[int, float, bool, str, float]]:
-    """Streams requests at a strictly constant rate (e.g. 20 req/s) concurrently."""
-    interval = 1.0 / rate_per_sec
-    tasks = []
-    start_time = time.time()
-    idx = 0
-
-    while (time.time() - start_time) < duration_sec:
-        next_tick = start_time + (idx * interval)
-        now = time.time()
-        if next_tick > now:
-            await asyncio.sleep(next_tick - now)
-        tasks.append(asyncio.create_task(send_single_probe(idx, target_url)))
-        idx += 1
-
-    results = await asyncio.gather(*tasks)
-    return results
-
-def run_single_failover_trial(trial_idx: int, use_passive: bool = True, project_root: str = "") -> Dict[str, Any]:
-    """Executes a single randomized HA failover trial."""
-    lb_bin = os.path.join(project_root, "build", "loadbalancer")
-    if not os.path.exists(lb_bin):
-        lb_bin = os.path.join(project_root, "build-host", "loadbalancer")
-
-    # 1. Clean previous state and start all 3 backends if using docker
-    run_cmd("docker compose start backend1 backend2 backend3 2>/dev/null || true")
-    run_cmd("docker compose exec -T loadbalancer pkill -9 loadbalancer 2>/dev/null || true")
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
-    time.sleep(0.5)
-
-    # 2. Start load balancer with 1s health check interval (-h 1)
-    pass_flag = "" if use_passive else "-F"
-    is_docker = run_cmd("docker compose ps -q loadbalancer 2>/dev/null").stdout.strip() != ""
-    if is_docker:
-        run_cmd(f"docker compose exec -d loadbalancer taskset -c 0 /app/build/loadbalancer -e -h 1 {pass_flag} -p 8080")
-        lb_proc = None
-    else:
-        lb_proc = subprocess.Popen(
-            f"taskset -c 0 {lb_bin} -e -h 1 {pass_flag} -p 8080 > /dev/null 2>&1",
-            shell=True, preexec_fn=os.setsid
-        )
-    time.sleep(1.0)
-
-    # Randomized kill offset in [1.2s, 2.0s] to avoid phase locking with health check tick
-    kill_offset = random.uniform(1.2, 2.0)
-    total_duration = 7.0
-    rate = 20
-
-    async def trial_coro():
-        # Stream probes in background
-        probe_task = asyncio.create_task(stream_probes("http://127.0.0.1:8080/", rate_per_sec=rate, duration_sec=total_duration))
-        
-        # Wait until kill_offset
-        await asyncio.sleep(kill_offset)
-        t_kill = time.time()
-        
-        # Kill backend2 container (or local process)
-        run_cmd("docker compose kill -s SIGKILL backend2 2>/dev/null || pkill -9 -f 'dummy_backend 9002' 2>/dev/null || true")
-        
-        # Wait 2.5s and then restore backend2 to test recovery
-        await asyncio.sleep(2.5)
-        t_restore = time.time()
-        run_cmd("docker compose start backend2 2>/dev/null || true")
-
-        results = await probe_task
-        return t_kill, t_restore, results
-
-    t_kill, t_restore, results = asyncio.run(trial_coro())
-
-    # Stop load balancer
-    if lb_proc:
+def start_backend(binary: Path, port: int) -> subprocess.Popen:
+    process = subprocess.Popen([str(binary), str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"backend {port} exited during startup")
         try:
-            os.killpg(os.getpgid(lb_proc.pid), 9)
-        except Exception:
-            pass
-    run_cmd("docker compose exec -T loadbalancer pkill -9 loadbalancer 2>/dev/null || true")
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return process
+        except OSError:
+            time.sleep(0.05)
+    process.kill()
+    raise TimeoutError(f"backend {port} failed readiness")
 
-    # Post-kill analysis
-    post_kill = [r for r in results if r[1] >= t_kill]
-    failures = [r for r in post_kill if not r[2]]
 
-    if failures:
-        first_fail_t = failures[0][1] - t_kill
-        last_fail_t = failures[-1][1] - t_kill
-        convergence = max(0.0, last_fail_t + (1.0 / rate))
-    else:
-        first_fail_t = 0.0
-        last_fail_t = 0.0
-        convergence = 0.0
+def stop_process(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
 
-    return {
-        "trial": trial_idx,
-        "use_passive": use_passive,
-        "kill_offset": kill_offset,
-        "total_requests": len(results),
-        "post_kill_requests": len(post_kill),
-        "failed_requests": len(failures),
-        "convergence_sec": convergence,
-        "first_fail_sec": first_fail_t
-    }
 
-def main():
-    print("========================================================================")
-    print(" HIGH-AVAILABILITY FAILOVER & HA CONVERGENCE BENCHMARK")
-    print("========================================================================")
+def start_lb(binary: Path, lb_port: int, passive: bool) -> subprocess.Popen:
+    command = [str(binary), "-e", "-p", str(lb_port), "-h", "1"]
+    if not passive:
+        command.append("-F")
+    for backend_port in BACKEND_PORTS:
+        command.extend(["-b", f"127.0.0.1:{backend_port}"])
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("load balancer exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", lb_port), timeout=0.1):
+                return process
+        except OSError:
+            time.sleep(0.05)
+    stop_process(process)
+    raise TimeoutError("load balancer failed readiness")
 
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    trials_count = 20
-    if len(sys.argv) > 1:
-        trials_count = int(sys.argv[1])
 
-    # 1. Evaluate Passive Failover Enabled (Default)
-    print(f"\n[Test Suite A] Passive Failover ENABLED ({trials_count} Monte Carlo trials @ 20 req/s)...")
-    passive_trials = []
-    for i in range(trials_count):
-        res = run_single_failover_trial(i + 1, use_passive=True, project_root=project_root)
-        passive_trials.append(res)
-        print(f"  Trial {i+1:2d}: Failures={res['failed_requests']:2d} | Convergence={res['convergence_sec']:.3f}s (offset={res['kill_offset']:.2f}s)")
+async def send_probe(index: int, host: str, port: int) -> dict:
+    sent_at = time.monotonic()
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=1.0)
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(1024), timeout=1.0)
+        success = b"200 OK" in response
+        backend = re.search(rb"(?im)^X-Backend-Port:\s*(\d+)", response)
+        return {"index": index, "sent_at": sent_at, "success": success,
+                "backend_port": int(backend.group(1)) if backend else None,
+                "error": "" if success else "non-200 or empty response"}
+    except Exception as error:
+        return {"index": index, "sent_at": sent_at, "success": False,
+                "backend_port": None, "error": str(error)}
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-    # 2. Evaluate Active Health Check Only (-F, Passive Disabled)
-    print(f"\n[Test Suite B] Active-Only Failover (-F, {trials_count} Monte Carlo trials @ 20 req/s)...")
-    active_trials = []
-    for i in range(trials_count):
-        res = run_single_failover_trial(i + 1, use_passive=False, project_root=project_root)
-        active_trials.append(res)
-        print(f"  Trial {i+1:2d}: Failures={res['failed_requests']:2d} | Convergence={res['convergence_sec']:.3f}s (offset={res['kill_offset']:.2f}s)")
 
-    # Compute Statistics matching Table 3.5 format
-    conv_pass = [t["convergence_sec"] for t in passive_trials]
-    drops_pass = [t["failed_requests"] for t in passive_trials]
+async def stream_probes(host: str, port: int, rate: int, duration: float) -> list[dict]:
+    start = time.monotonic()
+    tasks = []
+    index = 0
+    while True:
+        tick = start + index / rate
+        now = time.monotonic()
+        if tick >= start + duration:
+            break
+        if tick > now:
+            await asyncio.sleep(tick - now)
+        tasks.append(asyncio.create_task(send_probe(index, host, port)))
+        index += 1
+    return await asyncio.gather(*tasks)
 
-    conv_act = [t["convergence_sec"] for t in active_trials]
-    drops_act = [t["failed_requests"] for t in active_trials]
 
-    s_conv_pass = compute_stats(conv_pass)
-    s_drops_pass = compute_stats(drops_pass)
+def run_trial(binary: Path, backend_binary: Path, lb_port: int, passive: bool,
+              run_index: int, rate: int, duration: float, kill_offset: float,
+              outage_duration: float) -> dict:
+    backends = []
+    lb = None
+    try:
+        for port in BACKEND_PORTS:
+            backends.append(start_backend(backend_binary, port))
+        lb = start_lb(binary, lb_port, passive)
 
-    s_conv_act = compute_stats(conv_act)
-    s_drops_act = compute_stats(drops_act)
+        async def trial():
+            probe_task = asyncio.create_task(stream_probes("127.0.0.1", lb_port, rate, duration))
+            start = time.monotonic()
+            await asyncio.sleep(kill_offset)
+            kill_at = time.monotonic()
+            backends[1].kill()
+            backends[1].wait(timeout=2)
+            await asyncio.sleep(outage_duration)
+            restore_at = time.monotonic()
+            backends[1] = start_backend(backend_binary, BACKEND_PORTS[1])
+            results = await probe_task
+            return start, kill_at, restore_at, results
 
-    print("\n========================================================================")
-    print(" EMPIRICAL FAILOVER COMPARISON (Table 3.5)")
-    print("========================================================================")
-    print("### Mode 1: Active-Only Failover (-F, Probes every 1.0s):")
-    print(f"| Metric | Minimum | Median | Mean ± StdDev | Maximum |")
-    print(f"| :--- | :--- | :--- | :--- | :--- |")
-    print(f"| **Convergence Duration** | **{s_conv_act['min']:.3f} s** | **{s_conv_act['median']:.3f} s** | **{s_conv_act['mean']:.3f} s ± {s_conv_act['stddev']:.3f} s** | **{s_conv_act['max']:.3f} s** |")
-    print(f"| **Total Dropped Requests** | **{s_drops_act['min']:.0f}** | **{s_drops_act['median']:.1f}** | **{s_drops_act['mean']:.2f} ± {s_drops_act['stddev']:.2f}** | **{s_drops_act['max']:.0f}** |")
+        start, kill_at, restore_at, results = asyncio.run(trial())
+        post_kill = [item for item in results if item["sent_at"] >= kill_at]
+        pre_restore_failures = [item for item in post_kill if not item["success"] and item["sent_at"] < restore_at]
+        all_failures = [item for item in post_kill if not item["success"]]
+        detection_window = (max(item["sent_at"] for item in pre_restore_failures) - kill_at) if pre_restore_failures else None
+        backend_returns = [item for item in results
+                           if item["success"] and item["backend_port"] == BACKEND_PORTS[1]
+                           and item["sent_at"] >= restore_at]
+        backend_return_delay = (min(item["sent_at"] for item in backend_returns) - restore_at
+                                if backend_returns else None)
+        return {
+            "trial": run_index,
+            "mode": "passive" if passive else "active_only",
+            "rate_per_second": rate,
+            "duration_seconds": duration,
+            "kill_offset_seconds": kill_at - start,
+            "outage_seconds": restore_at - kill_at,
+            "requests_total": len(results),
+            "requests_after_kill": len(post_kill),
+            "dropped_after_kill": len(all_failures),
+            "dropped_before_restore": len(pre_restore_failures),
+            "last_failure_before_restore_seconds": detection_window,
+            "first_failure_seconds": (min(item["sent_at"] for item in pre_restore_failures) - kill_at) if pre_restore_failures else None,
+            "first_success_to_restored_backend_seconds": backend_return_delay,
+            "probe_results": [{**item, "sent_at": round(item["sent_at"] - kill_at, 6)} for item in results],
+        }
+    finally:
+        stop_process(lb)
+        for process in backends:
+            stop_process(process)
 
-    print("\n### Mode 2: Passive Failover + Active Health Check (Instant Retry):")
-    print(f"| Metric | Minimum | Median | Mean ± StdDev | Maximum |")
-    print(f"| :--- | :--- | :--- | :--- | :--- |")
-    print(f"| **Convergence Duration** | **{s_conv_pass['min']:.3f} s** | **{s_conv_pass['median']:.3f} s** | **{s_conv_pass['mean']:.3f} s ± {s_conv_pass['stddev']:.3f} s** | **{s_conv_pass['max']:.3f} s** |")
-    print(f"| **Total Dropped Requests** | **{s_drops_pass['min']:.0f}** | **{s_drops_pass['median']:.1f}** | **{s_drops_pass['mean']:.2f} ± {s_drops_pass['stddev']:.2f}** | **{s_drops_pass['max']:.0f}** |")
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("trials", nargs="?", type=int, default=20)
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--rate", type=int, default=20)
+    parser.add_argument("--duration", type=float, default=7.0)
+    parser.add_argument("--outage", type=float, default=2.5)
+    parser.add_argument("--seed", type=int, default=20261023)
+    parser.add_argument("--output", default=str(ROOT / "results/failover_trials.json"))
+    args = parser.parse_args()
+    if args.trials < 1 or args.rate < 1 or args.duration <= 0 or args.outage <= 0:
+        parser.error("trials/rate must be positive and durations must be > 0")
+
+    build_dir = ROOT / "build"
+    if not (build_dir / "loadbalancer").exists():
+        build_dir = ROOT / "build-host"
+    binary, backend_binary = build_dir / "loadbalancer", build_dir / "dummy_backend"
+    random.seed(args.seed)
+    data = {"seed": args.seed, "rate_per_second": args.rate, "duration_seconds": args.duration,
+            "outage_seconds": args.outage, "trials_per_mode": args.trials, "modes": {}}
+
+    for mode_index, passive in enumerate((False, True)):
+        mode = "passive" if passive else "active_only"
+        rows = []
+        for i in range(args.trials):
+            offset = random.uniform(0.8, min(2.0, args.duration - args.outage - 0.1))
+            row = run_trial(binary, backend_binary, args.port, passive, i + 1, args.rate,
+                            args.duration, offset, args.outage)
+            rows.append(row)
+            print(f"{mode} trial {i + 1}/{args.trials}: drops={row['dropped_after_kill']} "
+                  f"pre_restore={row['dropped_before_restore']} "
+                  f"last_failure={row['last_failure_before_restore_seconds']}")
+        expected = round(args.rate * args.duration)
+        if any(row["requests_total"] < expected * 0.9 for row in rows):
+            raise RuntimeError(f"{mode}: one or more trials produced fewer than 90% of scheduled probes")
+        data["modes"][mode] = rows
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(data, indent=2) + "\n")
+    for mode, rows in data["modes"].items():
+        drops = [row["dropped_after_kill"] for row in rows]
+        windows = [row["last_failure_before_restore_seconds"] for row in rows
+                   if row["last_failure_before_restore_seconds"] is not None]
+        print(f"{mode}: drops {format_stats(compute_stats(drops), unit='requests')}; "
+              f"measured failure window samples={len(windows)}")
+    print(f"Raw failover trials written to {output}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -23,7 +23,7 @@ async def open_idle_conn(host: str, port: int, local_ip: Optional[str] = None) -
         writer.write(req)
         await writer.drain()
         resp = await asyncio.wait_for(reader.read(256), timeout=5.0)
-        if b"200 OK" in resp or len(resp) > 0:
+        if b"200 OK" in resp:
             return (reader, writer)
         writer.close()
         await writer.wait_closed()
@@ -40,13 +40,21 @@ async def measure_active_latency(host: str, port: int, samples: int = 20) -> flo
         # 1 warmup transaction
         writer.write(req)
         await writer.drain()
-        await reader.read(256)
+        response = await reader.read(256)
+        if b"200 OK" not in response:
+            writer.close()
+            await writer.wait_closed()
+            return 0.0
 
         for _ in range(samples):
             t0 = time.perf_counter()
             writer.write(req)
             await writer.drain()
-            await reader.read(256)
+            response = await reader.read(256)
+            if b"200 OK" not in response:
+                writer.close()
+                await writer.wait_closed()
+                return 0.0
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
         writer.close()
@@ -80,13 +88,13 @@ async def run(target_conns: int, host: str = "127.0.0.1", port: int = 8080, hold
     established = len(connections)
     rate = established / max(duration, 0.001)
     
-    print(f"\n[STAGE] HANDSHAKE_COMPLETE Established={established}/{target_conns} DurationSec={duration:.2f} ConnRate={rate:.0f}")
+    print(f"\n[STAGE] HANDSHAKE_COMPLETE Established={established}/{target_conns} DurationSec={duration:.2f} ConnRate={rate:.0f}", flush=True)
 
     print(f"[STAGE] PROBING_ACTIVE_LATENCY (20 samples under idle load)...")
     active_lat_ms = await measure_active_latency(host, port, samples=20)
     print(f"Active Request Latency: {active_lat_ms:.3f} ms")
 
-    print(f"[STAGE] HOLD_START DurationSec={hold_seconds}")
+    print(f"[STAGE] HOLD_START DurationSec={hold_seconds} Established={established} HandshakeSec={duration:.2f} ConnRate={rate:.0f} ActiveLatMs={active_lat_ms:.2f}", flush=True)
     await asyncio.sleep(hold_seconds)
     print(f"[STAGE] HOLD_COMPLETE")
 

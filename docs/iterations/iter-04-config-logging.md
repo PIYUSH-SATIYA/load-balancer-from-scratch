@@ -11,16 +11,12 @@ We implemented `ConfigParser` using the standard POSIX `getopt` function.
 `./loadbalancer -p 8080 -a round_robin -b backend1:9001 -b backend2:9002`
 
 ### 2. POSIX Signals for Observability (`SIGUSR1`)
-We registered a signal handler for `SIGUSR1`.
-```cpp
-std::signal(SIGUSR1, handle_sigusr1);
-```
-*Why this matters:* In a production environment, you can't just stop the load balancer to see how many requests it has processed. By intercepting a Unix signal (like `SIGUSR1`, which is specifically reserved for user-defined purposes), we can tell the process to print its internal state to the console without interrupting traffic.
+We block `SIGUSR1` and receive it in a dedicated `sigwait` thread.
+*Why this matters:* A normal thread can safely print a snapshot while the proxy continues to serve connections. Standard C++ stream operations are not safe inside an asynchronous signal handler.
 
-### 3. Tracking Total Requests
-We added an `std::atomic<int> total_requests` to the `Backend` struct, and the Round Robin algorithm increments it every time a backend is selected.
-*Why this matters:* We can now objectively verify that our load balancing algorithm is distributing traffic fairly. When we query the stats, we should see `total_requests` evenly split across all backends.
+### 3. Tracking Backend Selections
+The algorithms increment an atomic per-backend counter when they select a backend for a new TCP connection. This counts selections, including selections whose later connection attempt may fail. It is not an HTTP request count: the Layer 4 proxy forwards payload bytes without parsing HTTP.
 
 ## How to Verify This Iteration
 
-Run the proxy, send it a few requests, and then send it the `SIGUSR1` signal to print its statistics!
+Run the proxy, open several TCP connections, and send `SIGUSR1` to print its statistics. The output labels this counter as `Backend Selections`.

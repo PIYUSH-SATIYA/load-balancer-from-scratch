@@ -1,262 +1,214 @@
 #!/usr/bin/env python3
+"""End-to-end checks for the three routing algorithms.
+
+The suite starts its own local backends and load balancer, records every trial
+as JSON, and exits nonzero if a stated property is not observed.
 """
-Routing Algorithm Empirical Validation Suite.
-Validates:
-  1. Round Robin: Strict uniform circular distribution across UP backends.
-  2. Least Connections: Verifies traffic steers away from backends under load.
-  3. Consistent Hashing: Verifies 100% session affinity per IP and hash ring distribution.
-Includes statistical analysis (5 runs minimum) and generates markdown summary tables.
-"""
-import sys
+import argparse
+import json
 import os
-import time
+import re
+import signal
 import socket
-import asyncio
 import subprocess
-import urllib.request
-from typing import Dict, List, Tuple
+import tempfile
+import time
+from collections import Counter
+from pathlib import Path
 
-# Add bench directory to path for bench.lib.stats
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bench.lib.stats import compute_stats, format_stats
 
-def run_cmd(cmd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+ROOT = Path(__file__).resolve().parents[1]
+BACKENDS = (9001, 9002, 9003)
 
-def parse_sigusr1_stats(log_text: str) -> Dict[str, Dict[str, int]]:
-    """
-    Parse output from SIGUSR1 stats dump:
-    backend1:9001 | Status: UP | Active Conns: 0 | Total Requests: 10
-    """
-    stats = {}
-    for line in log_text.splitlines():
-        if " | Status:" in line and " | Total Requests:" in line:
-            parts = line.strip().split(" | ")
-            backend_id = parts[0].strip()
-            # extract active conns
-            active_str = [p for p in parts if "Active Conns:" in p][0]
-            active_conns = int(active_str.split(":")[1].strip())
-            # extract total requests
-            req_str = [p for p in parts if "Total Requests:" in p][0]
-            total_reqs = int(req_str.split(":")[1].strip())
-            stats[backend_id] = {
-                "active_connections": active_conns,
-                "total_requests": total_reqs
-            }
-    return stats
 
-async def hold_connections(host: str, port: int, count: int) -> List[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
-    """Open and hold persistent keep-alive connections to simulate active load."""
-    conns = []
-    for _ in range(count):
+def wait_port(host: str, port: int, process: subprocess.Popen, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"process exited before {host}:{port} became ready")
         try:
-            reader, writer = await asyncio.open_connection(host, port)
-            # Send initial GET with keep-alive
-            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
-            writer.write(req)
-            await writer.drain()
-            await reader.read(128)
-            conns.append((reader, writer))
-        except Exception:
-            pass
-    return conns
+            with socket.create_connection((host, port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise TimeoutError(f"{host}:{port} did not become ready")
 
-def close_connections(conns: List[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]):
-    for reader, writer in conns:
-        try:
-            writer.close()
-        except Exception:
-            pass
 
-def send_http_requests(url: str, count: int, client_ip: str = None) -> List[bool]:
-    """Send sequential HTTP requests to verify routing."""
-    results = []
-    for _ in range(count):
-        try:
-            req = urllib.request.Request(url, headers={"Connection": "close"})
-            with urllib.request.urlopen(req, timeout=1.0) as resp:
-                results.append(resp.status == 200)
-        except Exception:
-            results.append(False)
-    return results
+def response_backend(sock: socket.socket) -> int:
+    data = bytearray()
+    while b"\r\n\r\n" not in data or len(data) < data.find(b"\r\n\r\n") + 4 + 13:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+    match = re.search(rb"(?im)^X-Backend-Port:\s*(\d+)", data)
+    if not match:
+        raise RuntimeError(f"backend response missing X-Backend-Port: {data[:200]!r}")
+    return int(match.group(1))
 
-def test_round_robin(lb_cmd: str, target_url: str, log_file: str, n_requests: int = 30) -> Dict[str, int]:
-    """Test Round Robin algorithm for strict circular distribution."""
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
-    time.sleep(0.3)
-    run_cmd(f"{lb_cmd} -a round_robin > {log_file} 2>&1 &")
-    time.sleep(1.0)
 
-    send_http_requests(target_url, n_requests)
-    run_cmd("pkill -USR1 -f loadbalancer")
-    time.sleep(0.5)
+def request(host: str, port: int, source_ip: str = "127.0.0.1", keep_open: bool = False):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    sock.bind((source_ip, 0))
+    sock.connect((host, port))
+    connection = "keep-alive" if keep_open else "close"
+    sock.sendall(f"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: {connection}\r\n\r\n".encode())
+    backend = response_backend(sock)
+    if not keep_open:
+        sock.close()
+    return backend, sock
 
-    stats = parse_sigusr1_stats(run_cmd(f"cat {log_file}").stdout)
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
 
-    return {k: v["total_requests"] for k, v in stats.items()}
-
-def send_tcp_request(host: str, port: int, source_ip: str = None) -> bool:
-    """Send an HTTP request via raw TCP socket, optionally binding to a distinct local IPv4 source IP."""
+def run_trial(lb_bin: Path, host: str, listen_port: int, algo: str):
+    log = tempfile.NamedTemporaryFile(mode="w+", delete=False)
+    command = [str(lb_bin), "-e", "-p", str(listen_port), "-a", algo]
+    for backend_port in BACKENDS:
+        command += ["-b", f"127.0.0.1:{backend_port}"]
+    process = subprocess.Popen(command, stdout=log, stderr=log)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if source_ip:
-            s.bind((source_ip, 0))
-        s.settimeout(2.0)
-        s.connect((host, port))
-        s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        data = s.recv(1024)
-        s.close()
-        return len(data) > 0
+        wait_port(host, listen_port, process)
+        time.sleep(0.2)  # Drain the readiness connection before routing measurements.
+        return process, log
     except Exception:
-        return False
+        process.terminate()
+        process.wait(timeout=2)
+        log.flush()
+        log.seek(0)
+        raise RuntimeError(log.read())
 
-def test_least_connections(lb_cmd: str, target_host: str, target_port: int, log_file: str) -> Dict[str, int]:
-    """
-    Test Least Connections algorithm:
-    1. Pre-establish 10 concurrent connections to the LB.
-    2. Selectively keep connections open on one backend to bias its active_connections.
-    3. Send 20 sequential requests to verify they steer exclusively to less-loaded backends.
-    """
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
-    time.sleep(0.3)
-    run_cmd(f"{lb_cmd} -a least_connections > {log_file} 2>&1 &")
-    time.sleep(1.0)
 
-    # 1. Open 10 keepalive connections to LB
-    held = []
-    for _ in range(10):
+def stop_lb(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2.0)
-            s.connect((target_host, target_port))
-            s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
-            s.recv(1024)
-            held.append(s)
-        except Exception:
-            pass
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
 
-    # 2. Close 6 of them, leaving 4 active connections pinned on the first node
-    for s in held[4:]:
-        try:
-            s.close()
-        except Exception:
-            pass
-    time.sleep(0.2)
 
-    # 3. Fire 20 sequential requests through the load balancer
-    for _ in range(20):
-        send_tcp_request(target_host, target_port)
+def read_stats(process: subprocess.Popen, log) -> dict:
+    os.kill(process.pid, signal.SIGUSR1)
+    time.sleep(0.1)
+    log.flush()
+    log.seek(0)
+    text = log.read()
+    parsed = {}
+    for line in text.splitlines():
+        match = re.search(r"(127\.0\.0\.1:\d+) \| Status: (UP|DOWN) \| Active Conns: (\d+) \| Backend Selections: (\d+)", line)
+        if match:
+            parsed[int(match.group(1).rsplit(":", 1)[1])] = {
+                "status": match.group(2), "active": int(match.group(3)), "selections": int(match.group(4))
+            }
+    if set(parsed) != set(BACKENDS):
+        raise RuntimeError(f"could not parse stats snapshot: {text[-1000:]}")
+    return parsed
 
-    # 4. Close remaining held connections
-    for s in held[:4]:
-        try:
-            s.close()
-        except Exception:
-            pass
-    time.sleep(0.2)
 
-    run_cmd("pkill -USR1 -f loadbalancer")
-    time.sleep(0.5)
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--output", default=str(ROOT / "results/algorithm_trials.json"))
+    args = parser.parse_args()
+    build = ROOT / "build" / "loadbalancer"
+    lb_bin = build if build.exists() else ROOT / "build-host" / "loadbalancer"
+    backend_bin = build.parent / "dummy_backend"
+    if not backend_bin.exists():
+        backend_bin = ROOT / "build-host" / "dummy_backend"
+    if not lb_bin.exists() or not backend_bin.exists():
+        raise SystemExit("Build loadbalancer and dummy_backend before running this suite")
 
-    stats = parse_sigusr1_stats(run_cmd(f"cat {log_file}").stdout)
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
+    backend_processes = []
+    trials = {"round_robin": [], "least_connections": [], "consistent_hashing": []}
+    try:
+        for backend_port in BACKENDS:
+            process = subprocess.Popen([str(backend_bin), str(backend_port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            backend_processes.append(process)
+            wait_port("127.0.0.1", backend_port, process)
 
-    return {k: v["total_requests"] for k, v in stats.items()}
+        for run_index in range(args.runs):
+            # Round robin: each of 30 new TCP connections must advance one slot.
+            lb, log = run_trial(lb_bin, "127.0.0.1", args.port, "round_robin")
+            counts = Counter(request("127.0.0.1", args.port)[0] for _ in range(30))
+            stats = read_stats(lb, log)
+            stop_lb(lb)
+            log.close()
+            if counts != Counter({p: 10 for p in BACKENDS}):
+                raise AssertionError(f"round robin was not 10/10/10: requests={counts}, stats={stats}")
+            trials["round_robin"].append({"counts": dict(counts), "stats": stats})
 
-def test_consistent_hashing(lb_cmd: str, target_host: str, target_port: int, log_file: str, client_ips: List[str]) -> Dict[str, int]:
-    """
-    Test Consistent Hashing distribution across 30 distinct client IPv4 source addresses (127.0.0.1-30).
-    Verifies that distinct client IPs hash to different virtual nodes across the ring.
-    """
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
-    time.sleep(0.3)
-    run_cmd(f"{lb_cmd} -a consistent_hashing > {log_file} 2>&1 &")
-    time.sleep(1.0)
+            # Least-connections: build a 2/1/1 baseline, then retain only the
+            # two connections on backend 9001. New held sessions should avoid it.
+            lb, log = run_trial(lb_bin, "127.0.0.1", args.port, "least_connections")
+            initial = [request("127.0.0.1", args.port, keep_open=True) for _ in range(4)]
+            held_by_backend = {p: [] for p in BACKENDS}
+            for backend_port, sock in initial:
+                held_by_backend[backend_port].append(sock)
+            if len(held_by_backend[9001]) < 2:
+                for sockets in held_by_backend.values():
+                    for sock in sockets: sock.close()
+                stop_lb(lb)
+                raise AssertionError(f"unexpected initial least-connections placement: { {p: len(v) for p, v in held_by_backend.items()} }")
+            # Keep exactly two sessions on the first backend; close all other
+            # baseline connections. The next selections must prefer idle nodes.
+            for p, sockets in held_by_backend.items():
+                keep = sockets[:2] if p == 9001 else []
+                for sock in sockets:
+                    if sock not in keep: sock.close()
+                held_by_backend[p] = keep
+            time.sleep(0.2)  # Let the proxy observe those FINs before sampling least counts.
+            added = []
+            added_counts = Counter()
+            for _ in range(8):
+                backend_port, sock = request("127.0.0.1", args.port, keep_open=True)
+                added_counts[backend_port] += 1
+                added.append((backend_port, sock))
+            stats = read_stats(lb, log)
+            for sockets in held_by_backend.values():
+                for sock in sockets: sock.close()
+            for _, sock in added: sock.close()
+            stop_lb(lb)
+            log.close()
+            if added_counts[9001] > 2 or max(added_counts.values()) - min(added_counts.values()) > 1:
+                raise AssertionError(f"least-connections did not rebalance around the held load: initial={Counter(p for p, _ in initial)}, added={added_counts}")
+            trials["least_connections"].append({"added_counts": dict(added_counts), "stats": stats})
 
-    # Send 1 request per distinct client IP
-    for ip in client_ips:
-        send_tcp_request(target_host, target_port, source_ip=ip)
+            # Consistent hashing: each source IP must retain its backend across
+            # two separate TCP connections in this process.
+            lb, log = run_trial(lb_bin, "127.0.0.1", args.port, "consistent_hashing")
+            mapping = {}
+            distribution = Counter()
+            for source_octet in range(1, 31):
+                source_ip = f"127.0.0.{source_octet}"
+                first = request("127.0.0.1", args.port, source_ip)[0]
+                second = request("127.0.0.1", args.port, source_ip)[0]
+                if first != second:
+                    stop_lb(lb)
+                    raise AssertionError(f"client {source_ip} changed backend: {first} -> {second}")
+                mapping[source_ip] = first
+                distribution[first] += 1
+            stats = read_stats(lb, log)
+            stop_lb(lb)
+            log.close()
+            if sum(distribution.values()) != 30:
+                raise AssertionError(f"consistent hashing lost clients: {distribution}")
+            trials["consistent_hashing"].append({"distribution": dict(distribution), "mapping": mapping, "stats": stats})
+            print(f"run {run_index + 1}/{args.runs}: RR={dict(counts)} LC={dict(added_counts)} CH={dict(distribution)}")
+    finally:
+        for process in backend_processes:
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=2)
+                except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=2)
 
-    run_cmd("pkill -USR1 -f loadbalancer")
-    time.sleep(0.5)
+    output = {"runs": args.runs, "backend_ports": list(BACKENDS), "trials": trials}
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output).write_text(json.dumps(output, indent=2) + "\n")
+    print(f"PASS: all algorithm properties verified; raw results: {args.output}")
+    return 0
 
-    stats = parse_sigusr1_stats(run_cmd(f"cat {log_file}").stdout)
-    run_cmd("pkill -9 -f loadbalancer 2>/dev/null || true")
-
-    return {k: v["total_requests"] for k, v in stats.items()}
-
-def main():
-    print("========================================================================")
-    print(" ROUTING ALGORITHM EMPIRICAL VALIDATION SUITE")
-    print("========================================================================")
-
-    # Path to load balancer executable
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    lb_bin = os.path.join(project_root, "build", "loadbalancer")
-    if not os.path.exists(lb_bin):
-        lb_bin = os.path.join(project_root, "build-host", "loadbalancer")
-
-    target_host = "127.0.0.1"
-    target_port = 8080
-    target_url = f"http://{target_host}:{target_port}/"
-    log_file = "/tmp/lb_algo_test.log"
-    lb_cmd = f"taskset -c 0 {lb_bin} -e -p {target_port}"
-
-    runs = 5
-    print(f"Target Executable: {lb_bin}")
-    print(f"Testing 3 Algorithms over {runs} repetitions...")
-
-    # 1. Round Robin
-    print("\n--- 1. Evaluating Round Robin Uniformity ---")
-    rr_runs = []
-    for r in range(runs):
-        res = test_round_robin(lb_cmd, target_url, log_file, n_requests=30)
-        rr_runs.append(res)
-        print(f"  Run {r+1}: {res}")
-
-    # 2. Least Connections
-    print("\n--- 2. Evaluating Least Connections Rebalancing ---")
-    lc_runs = []
-    for r in range(runs):
-        res = test_least_connections(lb_cmd, target_host, target_port, log_file)
-        lc_runs.append(res)
-        print(f"  Run {r+1}: {res}")
-
-    # 3. Consistent Hashing
-    print("\n--- 3. Evaluating Consistent Hashing Distribution ---")
-    # Generate 30 distinct client loopback IPv4 addresses (127.0.0.1-30)
-    client_ips = [f"127.0.0.{i+1}" for i in range(30)]
-    ch_runs = []
-    for r in range(runs):
-        res = test_consistent_hashing(lb_cmd, target_host, target_port, log_file, client_ips)
-        ch_runs.append(res)
-        print(f"  Run {r+1}: {res}")
-
-    print("\n========================================================================")
-    print(" ALGORITHM STATISTICAL SUMMARY (Table 3.6)")
-    print("========================================================================")
-    print("| Algorithm | Test Configuration | Backend 1 (:9001) | Backend 2 (:9002) | Backend 3 (:9003) | Routing Characteristics |")
-    print("| :--- | :--- | :--- | :--- | :--- | :--- |")
-
-    # Aggregate Round Robin
-    b1_rr = [r.get("backend1:9001", 0) for r in rr_runs]
-    b2_rr = [r.get("backend2:9002", 0) for r in rr_runs]
-    b3_rr = [r.get("backend3:9003", 0) for r in rr_runs]
-    print(f"| **Round Robin** | 30 requests, 1 source IP | **{compute_stats(b1_rr)['median']:.0f}** (33.3%) | **{compute_stats(b2_rr)['median']:.0f}** (33.3%) | **{compute_stats(b3_rr)['median']:.0f}** (33.3%) | Strict uniform circular distribution. |")
-
-    # Aggregate Least Connections
-    b1_lc = [r.get("backend1:9001", 0) for r in lc_runs]
-    b2_lc = [r.get("backend2:9002", 0) for r in lc_runs]
-    b3_lc = [r.get("backend3:9003", 0) for r in lc_runs]
-    print(f"| **Least Connections** | Active load on Node 1 | **{compute_stats(b1_lc)['median']:.0f}** ({compute_stats(b1_lc)['median']/30*100:.1f}%) | **{compute_stats(b2_lc)['median']:.0f}** ({compute_stats(b2_lc)['median']/30*100:.1f}%) | **{compute_stats(b3_lc)['median']:.0f}** ({compute_stats(b3_lc)['median']/30*100:.1f}%) | Inflight-aware: routes away from busy backend. |")
-
-    # Aggregate Consistent Hashing
-    b1_ch = [r.get("backend1:9001", 0) for r in ch_runs]
-    b2_ch = [r.get("backend2:9002", 0) for r in ch_runs]
-    b3_ch = [r.get("backend3:9003", 0) for r in ch_runs]
-    print(f"| **Consistent Hashing** | 30 distinct source IPs | **{compute_stats(b1_ch)['median']:.0f}** ({compute_stats(b1_ch)['median']/30*100:.1f}%) | **{compute_stats(b2_ch)['median']:.0f}** ({compute_stats(b2_ch)['median']/30*100:.1f}%) | **{compute_stats(b3_ch)['median']:.0f}** ({compute_stats(b3_ch)['median']/30*100:.1f}%) | Deterministic hash ring distribution. |")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

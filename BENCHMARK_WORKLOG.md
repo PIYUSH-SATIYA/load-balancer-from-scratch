@@ -7,6 +7,8 @@ Each entry records:
 3. Exact command string executed
 4. Execution outcome and observations
 
+> **Audit note:** Entries before the `Corrective Audit` section are historical notes from earlier runs. Their “Verified” labels are not independent proof and some conclusions were not supported by the checked-in artifacts. The current benchmark report is generated from the current CSV/JSON results; use it and those artifacts as the authoritative evidence.
+
 ---
 
 ## Log Entries
@@ -432,6 +434,21 @@ Each entry records:
   ```
 - **Status/Result**: Verified 453 lines cleanly formatted with complete tables.
 
+---
+
+## Corrective Audit
+
+The follow-up audit found that the earlier idle sweep sampled process memory after the client had closed its sockets, allowed partial connection attempts to be labeled as survived, and relied on a thread-per-connection dummy backend. The throughput CSV and earlier report also did not contain all of the datasets claimed by that report. Those old figures have been removed from the current generated report unless reproduced by the current artifacts.
+
+Corrections on branch `fix/audit-completion`:
+
+- The dummy HTTP backend now uses an `epoll` loop so the idle sweep does not impose a one-thread-per-upstream-connection ceiling.
+- The idle sweep samples during the hold stage and distinguishes `PASS`, `PARTIAL`, and `FAILED` based on achieved connections and proxy state.
+- The failover and routing suites now own local child processes, check outcomes, and save raw trial data as JSON.
+- The report generator builds the Markdown tables from the current CSV and JSON outputs.
+- The blocking proxy now preserves TCP half-closes and owns descriptor cleanup across both relay directions. The `SIGUSR1` stats path uses `sigwait` instead of iostreams in an asynchronous signal handler.
+- The per-backend statistic is named `Backend Selections`: it counts routing choices (including ones whose connection attempt may fail), not HTTP requests.
+
 ### [2026-10-15 22:19:45 IST]
 - **Reason**: Check git repository working tree status to review all modified, created, and untracked files across all benchmark remediation phases.
 - **Command**:
@@ -439,4 +456,24 @@ Each entry records:
   git status -s
   ```
 - **Status/Result**: Success. Clean working state with all modifications localized to benchmark scripts, load balancer sources, results CSVs, and report documentation.
+
+### [2026-10-23] Corrective audit and reproducible rerun (`fix/audit-completion`)
+
+The entries above are historical notes, not a verified statement that every planned phase or benchmark claim was complete. Several old claims (including 20k/30k idle capacity, theoretical failover convergence, and percentiles that `wrk` did not emit) were not supported by the artifacts at the time. The current report is generated from the raw artifacts listed below and supersedes those claims.
+
+- Scope is a learning project: a small TCP proxy used to study routing, blocking versus `epoll`, health checks, and measurement. It is not a product or an NGINX/HAProxy clone.
+- Rebuilt the host binary with CMake and ran the corrected throughput harness in Docker: 2 s warmup, 5 s measurement, five repeats at 50/100/200/400/800 connections across six modes. All 150 rows in `results/summary.csv` passed, with zero socket errors and zero non-2xx responses. The report uses the latency percentiles actually emitted by `wrk` (P50/P75/P90/P99); per-thread context switches are sampled during each trial.
+- Reran the idle sweep at 10k/20k/30k targets with 5 s hold. Only Epoll_Optimized at 10k passed (10,000 established; 0.04 ms active probe). The other five cells failed: requested targets were not reached and/or the active probe returned zero. These outcomes are recorded as failures in `results/idle_sweep_isolated.csv`; no higher idle-capacity claim is made.
+- Routing checks passed five trials for round robin, least connections, and consistent-hash reconnect affinity. The 20-trial failover dataset and 1 MiB TCP half-close checks are recorded in their JSON/raw artifacts and described in the generated report.
+- `docs/benchmark_report.md` and `results/parsed_report.md` were regenerated from the current artifacts. `bench/generate_report.py` is the source for those tables. The raw throughput logs are under `results/raw/`.
+- Verification: host CMake build passed; shell syntax checks, Python bytecode compilation, and `git diff --check` passed. `papers/` was excluded from this audit as local research input.
+
+### 2026-10-24: Branch verification and Git cleanup
+
+- Rebuilt the current branch with `cmake --build build-host`; both binaries succeeded.
+- Reran the three routing algorithm checks for five trials; all passed.
+- Reran the half-close payload check in both proxy modes; each preserved the 1 MiB request and drained the complete 1,048,608-byte response.
+- Reran one failover trial per mode as a smoke check: active-only observed six failed probes during the outage; passive retry observed zero. The report retains the separate 20-trial dataset.
+- Docker was unavailable (`docker compose ps` could not connect to `/var/run/docker.sock`), so the 150-cell throughput sweep and idle sweep were not rerun in this session. The report marks the short-run limitations and the CPU metric as host pinned-set utilization.
+- Local research inputs in `papers/` are now ignored by Git and preserved on disk. Raw benchmark output remains versioned with the report as its evidence.
 

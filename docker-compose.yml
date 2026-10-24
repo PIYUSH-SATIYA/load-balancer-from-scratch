@@ -1,5 +1,6 @@
 services:
   loadbalancer:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -9,9 +10,12 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - backend1
-      - backend2
-      - backend3
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
     networks:
       - lbnet
     ulimits:
@@ -28,12 +32,14 @@ services:
       - "8081:8080"
     networks:
       - lbnet
+    cpuset: "${LB_NGINX_CPUS:-0}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend1:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -43,12 +49,19 @@ services:
     command: ["/app/build/dummy_backend", "9001"]
     networks:
       - lbnet
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9001"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend2:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -58,12 +71,19 @@ services:
     command: ["/app/build/dummy_backend", "9002"]
     networks:
       - lbnet
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9002"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend3:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -73,6 +93,12 @@ services:
     command: ["/app/build/dummy_backend", "9003"]
     networks:
       - lbnet
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9003"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536

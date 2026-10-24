@@ -1,0 +1,10 @@
+{
+  "hold_seconds": 5,
+  "targets": [
+    10000,
+    20000,
+    30000
+  ],
+  "proxy_cpu": "0",
+  "platform": "Linux-7.2.9-arch1-1-x86_64-with-glibc2.44"
+}

@@ -45,3 +45,6 @@ dummy_backend
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local research inputs; these are not consumed by the build or benchmark suite.
+papers/

@@ -25,7 +25,7 @@ Backend* LeastConnections::select_backend(std::vector<Backend>& backends, const 
     }
 
     if (least_loaded) {
-        least_loaded->total_requests.fetch_add(1);
+        least_loaded->backend_selections.fetch_add(1);
     }
 
     return least_loaded;

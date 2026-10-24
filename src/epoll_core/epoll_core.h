@@ -74,7 +74,7 @@ private:
     std::unordered_map<int, std::shared_ptr<Session>> sessions;
     std::unordered_set<std::shared_ptr<Session>> pending_connects;
 
-    void set_non_blocking(int fd);
+    bool set_non_blocking(int fd);
     void update_epoll(int fd, uint32_t events);
     void remove_epoll(int fd);
     
