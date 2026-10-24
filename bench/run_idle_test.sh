@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/results}"
 OUT_CSV="$RESULTS_DIR/idle_sweep_isolated.csv"
+# HOLD_SEC keeps established sessions open while sampling. Separate target
+# overrides let us compare architectures at sensible resource limits.
 HOLD_SEC="${HOLD_SEC:-5}"
 PIN_PROXY="${PIN_PROXY:-0}"
 TARGETS=(${TARGETS_OVERRIDE:-10000 20000 30000})
@@ -26,6 +28,8 @@ ACTIVE_STOP_FILE=""
 
 mkdir -p "$RESULTS_DIR"
 if docker compose ps --status running -q loadbalancer 2>/dev/null | grep -q .; then
+    # Container mode can report cgroup memory and pid limits in addition to
+    # process metrics. The client still runs on the host in both modes.
     DOCKER_MODE=true
 fi
 
@@ -164,6 +168,8 @@ PY
 run_cell() {
     local mode="$1" epoll="$2" target="$3"
     CELL_INDEX=$((CELL_INDEX + 1))
+    # Use a fresh loopback source address for each cell to reduce client-side
+    # ephemeral-port/TIME_WAIT collisions in these large sequential sweeps.
     local slot=$(( ( $(date +%s) + CELL_INDEX ) % 240 + 1 ))
     local source_ip="127.0.${slot}.1"
     local proxy_pid="" mode_flags="" monitor_pid=""
@@ -199,9 +205,14 @@ run_cell() {
         return 1
     fi
 
+    # Capture process baseline before adding thousands of sessions; deltas make
+    # the connection-related footprint comparable across architectures.
     local baseline
     baseline=$(proxy_snapshot "$proxy_pid")
     rm -f "$snapshot_file" "$stop_file"
+    # Start sampling before dialing. At high thread counts the OS may refuse a
+    # new process, which would make a peak-only sampler disappear exactly when
+    # its measurements matter most.
     if [ "$DOCKER_MODE" = true ]; then
         docker compose exec -d loadbalancer python3 /app/bench/lib/sample_proc_metrics.py "$proxy_pid" \
             --include-cgroup --watch "/app/results/$snapshot_name" --stop-file "/app/results/$stop_name"
@@ -269,6 +280,8 @@ print(count, duration, rate, latency, failures)
 PY
     )
     local status="PASS"
+    # Reaching the target is necessary but not sufficient: an active probe and
+    # a valid process snapshot are required to call a row successful.
     if [ "$established" -lt "$target" ]; then status="PARTIAL"; fi
     if ! awk -v latency="$latency" 'BEGIN {exit !(latency + 0 > 0)}' || [ "$loaded" = "{}" ]; then status="FAILED"; fi
     append_row "$mode" "$target" "$established" "$duration" "$rate" "$baseline" "$loaded" "$latency" "$failures" "$status" "$source_ip" "$sampler_error"

@@ -12,8 +12,8 @@ ConsistentHashing::ConsistentHashing(const std::vector<Backend>& initial_backend
 void ConsistentHashing::add_node(size_t backend_index, const std::string& ip, int port) {
     std::hash<std::string> hasher;
     
-    // Create 'virtual_nodes' number of replicas for this backend on the ring.
-    // This ensures a uniform distribution of traffic.
+    // Multiple points give each backend many smaller ownership ranges. This
+    // improves expected balance but cannot guarantee uniform finite samples.
     for (int i = 0; i < virtual_nodes; ++i) {
         std::string vnode_name = ip + ":" + std::to_string(port) + "#" + std::to_string(i);
         size_t hash_val = hasher(vnode_name);

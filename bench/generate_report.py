@@ -18,6 +18,8 @@ def fnum(value, digits=2):
 
 
 def summarize_rows(rows, key):
+    # Use sample standard deviation only when there are repeats. A single
+    # observation is printed alone rather than given invented variability.
     values = [float(row[key]) for row in rows if row.get(key) not in (None, "")]
     if not values:
         return "—"
@@ -37,6 +39,8 @@ def median_metric(rows, key, digits=1):
 
 
 def throughput_section():
+    # Group raw per-cell samples into a readable table; summary.csv remains the
+    # underlying source of the reported observations.
     path = RESULTS / "summary.csv"
     if not path.exists():
         return "No throughput CSV is present."
@@ -64,6 +68,8 @@ def throughput_section():
 
 
 def idle_section():
+    # Preserve partial/failed achieved counts; never promote a requested target
+    # to a successful capacity result when the client did not establish it.
     path = RESULTS / "idle_sweep_isolated.csv"
     if not path.exists():
         return "No idle-sweep CSV is present."
@@ -166,6 +172,8 @@ def throughput_metadata():
 
 
 def failover_section():
+    # Recovery figures below are inferred from probe timestamps, not read from
+    # an internal health-check timer.
     path = RESULTS / "failover_trials.json"
     if not path.exists():
         return "No failover trial JSON is present."

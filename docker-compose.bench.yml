@@ -6,10 +6,12 @@ services:
       target: dev
     working_dir: /app
     volumes:
+      # Share the checkout and compiled build volume with the benchmark runner.
       - .:/app
       - build_cache:/app/build
     command: ["bash", "-lc", "cmake --build /app/build && ./bench/run_bench.sh"]
     depends_on:
+      # A benchmark cell must not measure backend startup or connection refusal.
       backend1:
         condition: service_healthy
       backend2:

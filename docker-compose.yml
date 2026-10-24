@@ -5,6 +5,8 @@ services:
       context: .
       target: dev
     volumes:
+      # Source stays editable on the host; build outputs persist in a named
+      # volume so a container rebuild does not erase compiled binaries.
       - .:/app
       - build_cache:/app/build
     ports:
@@ -20,6 +22,8 @@ services:
       - lbnet
     ulimits:
       nofile:
+        # A proxy needs two descriptors per proxied TCP connection. Make the
+        # container limit configurable for high-connection exercises.
         soft: ${LB_NOFILE_LIMIT:-131072}
         hard: ${LB_NOFILE_LIMIT:-131072}
     # Will run manually during dev
@@ -32,6 +36,7 @@ services:
       - "8081:8080"
     networks:
       - lbnet
+    # Keep Nginx off the default proxy CPU in the benchmark's chosen topology.
     cpuset: "${LB_NGINX_CPUS:-0}"
     ulimits:
       nofile:
@@ -50,6 +55,8 @@ services:
     networks:
       - lbnet
     healthcheck:
+      # Compose waits for a listening TCP socket before starting the proxy;
+      # this is only readiness, not an application-level health contract.
       test: ["CMD-SHELL", "nc -z 127.0.0.1 9001"]
       interval: 1s
       timeout: 1s
@@ -72,6 +79,8 @@ services:
     networks:
       - lbnet
     healthcheck:
+      # Same readiness check as backend1; Compose starts dependents only when
+      # each backend's TCP listener accepts connections.
       test: ["CMD-SHELL", "nc -z 127.0.0.1 9002"]
       interval: 1s
       timeout: 1s
@@ -94,6 +103,7 @@ services:
     networks:
       - lbnet
     healthcheck:
+      # Keep readiness checks consistent across the identical backend services.
       test: ["CMD-SHELL", "nc -z 127.0.0.1 9003"]
       interval: 1s
       timeout: 1s
@@ -105,6 +115,7 @@ services:
         hard: 65536
 
 networks:
+  # User-defined bridge provides service-name DNS (backend1, backend2, ...).
   lbnet:
     driver: bridge
 

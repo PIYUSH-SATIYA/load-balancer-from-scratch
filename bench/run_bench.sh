@@ -2,7 +2,8 @@
 # ==============================================================================
 # TCP Proxy: Automated Throughput and Latency Suite
 # Evaluates Active Throughput, Tail Latency, Context Switches, and CPU Core Usage
-# Across 6 Architectures and 5 Concurrency Levels (with statistical confidence)
+# Across selectable proxy modes and connection levels. N_RUNS controls repeats;
+# a one-run setting cannot support a meaningful confidence interval.
 # ==============================================================================
 set -euo pipefail
 
@@ -12,6 +13,8 @@ RESULTS_DIR="$PROJECT_ROOT/results"
 mkdir -p "$RESULTS_DIR"
 
 SUMMARY_CSV="$RESULTS_DIR/summary.csv"
+# Overrides let short and full runs use the same harness. Separate RAW_DIR values
+# preserve raw output from earlier experiments.
 RAW_DIR="${RAW_DIR:-$RESULTS_DIR/raw}"
 WARMUP_SEC="${WARMUP_SEC:-3}"
 DURATION_SEC="${DURATION_SEC:-10}"
@@ -23,7 +26,8 @@ else
     CONNS=("${DEFAULT_CONNS[@]}")
 fi
 
-# CPU Pinning Configuration (Intel 12-Core Topology: Cores 0-3 P-Cores, 4-7 Loadgen, 8-11 Backends)
+# Keep proxy, wrk, and dummy backends on disjoint CPU sets to reduce contention.
+# Override these defaults on hosts with a different CPU topology.
 PIN_PROXY_1CORE="${PIN_PROXY_1CORE:-0}"
 PIN_PROXY_4CORE="${PIN_PROXY_4CORE:-0-3}"
 PIN_LOADGEN="${PIN_LOADGEN:-4-7}"
@@ -31,7 +35,7 @@ PIN_BACKENDS="${PIN_BACKENDS:-8-11}"
 PIN_NGINX="${PIN_NGINX:-0}"
 export WARMUP_SEC DURATION_SEC N_RUNS PIN_PROXY_1CORE PIN_PROXY_4CORE PIN_LOADGEN PIN_BACKENDS PIN_NGINX
 
-# Binary paths
+# Explicit paths allow the same harness to run on the host or in containers.
 LB_BIN="${LB_BIN:-$PROJECT_ROOT/build/loadbalancer}"
 BACKEND_BIN="${BACKEND_BIN:-$PROJECT_ROOT/build/dummy_backend}"
 WRK_BIN="${WRK_BIN:-$(command -v wrk || echo "/usr/local/bin/wrk")}"
@@ -66,7 +70,8 @@ cleanup_processes() {
 }
 trap cleanup_processes EXIT INT TERM
 
-# Helper: aggregate CPU times for the CPUs assigned to the proxy.
+# /proc/stat provides host CPU counters, not per-process CPU. Restrict the
+# calculation to selected CPUs and report it as CPU-set busy time.
 get_core_stat() {
     local cores=" $* "
     awk -v selected="$cores" '$1 ~ /^cpu[0-9]+$/ {
@@ -119,7 +124,8 @@ calc_core_busy() {
     echo "$busy_pct $sys_pct $soft_pct"
 }
 
-# Run a single cell benchmark
+# One cell is one (mode, concurrency, repetition) measurement. Backends must
+# already be available; this function starts/stops the proxy under test.
 run_benchmark_cell() {
     local mode=$1
     local conns=$2
@@ -136,7 +142,7 @@ run_benchmark_cell() {
 
     case "$mode" in
         "Control")
-            # Direct backend bypassing load balancer
+            # Direct control isolates the client/backend cost from proxy work.
             if getent hosts backend1 >/dev/null 2>&1; then
                 target_url="http://backend1:9001/"
             else
@@ -144,12 +150,14 @@ run_benchmark_cell() {
             fi
             ;;
         "Epoll_Optimized")
+            # Pin the one-loop process separately from the wrk load generator.
             taskset -c "$PIN_PROXY_1CORE" "$LB_BIN" -e -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
             target_url="http://127.0.0.1:8080/"
             ;;
         "Epoll_4Workers")
+            # Four independent SO_REUSEPORT loops are pinned to four CPUs.
             taskset -c "$PIN_PROXY_4CORE" "$LB_BIN" -e -w 4 -p 8080 "${BACKEND_ARGS[@]}" > /dev/null 2>&1 &
             proxy_pid=$!
             CURRENT_PROXY_PID=$proxy_pid
@@ -187,11 +195,13 @@ run_benchmark_cell() {
         return 1
     fi
 
-    # Warmup phase (let TCP connection pool stabilize)
+    # Exclude startup and initial connection establishment from the sample.
+    # This short warmup is not a long soak or leak check.
     echo "  > Warmup (${WARMUP_SEC}s @ $conns conns)..."
     taskset -c "$PIN_LOADGEN" "$WRK_BIN" -t 2 -c "$conns" -d "${WARMUP_SEC}s" "$target_url" > /dev/null 2>&1 || true
 
-    # Pre-measurement state
+    # Snapshot host CPU counters and start per-thread proxy context-switch
+    # sampling immediately before active traffic begins.
     local cpu_set="$PIN_PROXY_1CORE"
     case "$mode" in
         Epoll_4Workers|Threaded_4Cores) cpu_set="$PIN_PROXY_4CORE" ;;
@@ -211,7 +221,8 @@ run_benchmark_cell() {
     fi
     local t0=$(date +%s%N)
 
-    # Measurement phase
+    # wrk maintains this many HTTP keep-alive connections and sends requests;
+    # this measures active throughput/latency, unlike the separate idle sweep.
     echo "  > Measuring (${DURATION_SEC}s @ $conns conns)..."
     local wrk_raw
     wrk_raw=$(taskset -c "$PIN_LOADGEN" "$WRK_BIN" -t 4 -c "$conns" -d "${DURATION_SEC}s" --latency "$target_url" 2>&1 || true)
@@ -278,7 +289,8 @@ run_benchmark_cell() {
         survived="PARTIAL"
     fi
 
-    # Core utilization
+    # CPU figures describe all work on the selected host CPUs, not proxy-only
+    # utilization. They help interpret saturation but are not process profiling.
     local core_metrics=($(calc_core_busy "$core_before" "$core_after"))
     local core_busy="${core_metrics[0]}"
     local core_sys="${core_metrics[1]}"
@@ -288,7 +300,8 @@ run_benchmark_cell() {
 
     echo "  > Result: RPS=$rps | P50=${p50}ms | P99=${p99}ms | CoreBusy=${core_busy}% | VolCSW/s=${vol_rate} | SampledThreads=$sampled_threads | Status=$survived"
 
-    # Append to summary.csv
+    # Preserve one row per sample so report generation can calculate spread
+    # across repetitions without discarding raw observations.
     echo "$mode,$conns,$rep,$rps,$p50,$p75,$p90,$p99,$requests,$total_errors,$non2xx,$core_busy,$core_sys,$core_soft,$cpu_per_krps,$vol_rate,$nvol_rate,$sampled_threads,$survived" >> "$SUMMARY_CSV"
 
     cleanup_processes
@@ -303,6 +316,8 @@ main() {
     echo " Results file: $SUMMARY_CSV"
     echo "========================================================================"
 
+    # Control bypasses the proxy. Nginx is optional and requires its Compose
+    # service; callers can pass a smaller mode list for host-only runs.
     local MODES=("Control" "Epoll_Optimized" "Epoll_4Workers" "Threaded_Proxy" "Threaded_4Cores" "Nginx_Stream")
     if [ $# -gt 0 ]; then
         MODES=("$@")

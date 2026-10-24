@@ -12,6 +12,8 @@
 #include <poll.h>
 
 ConnectionTracker::~ConnectionTracker() {
+    // Centralize descriptor cleanup and accounting so two relay threads cannot
+    // each decrement the same backend connection.
     if (client_fd >= 0) close(client_fd);
     if (backend_fd >= 0) close(backend_fd);
     if (backend) backend->active_connections.fetch_sub(1);
@@ -37,7 +39,9 @@ void ProxyCore::start() {
         return;
     }
 
-    // 2. Allow immediate port reuse (prevents TIME_WAIT binding issues)
+    // SO_REUSEADDR helps restart after prior connections. SO_REUSEPORT lets
+    // multiple independent worker listeners bind this same port; Linux shares
+    // incoming connections among them in the multi-worker configuration.
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
@@ -61,7 +65,8 @@ void ProxyCore::start() {
 
     LOG_INFO("Proxy listening on port " << listening_port << " (Passive Failover: " << (passive_failover ? "ON" : "OFF") << ")...");
 
-    // 5. Main Accept Loop: accept client and immediately delegate backend connection to worker thread
+    // Keep accept() in the main thread, then delegate backend connect and relay
+    // setup so a slow upstream does not stop the process accepting new clients.
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -102,6 +107,9 @@ void ProxyCore::start() {
                         }
                     }
 
+                    // Make just the connect phase nonblocking so poll can bound
+                    // the wait; restore flags after success because these relay
+                    // loops are intentionally the blocking baseline.
                     const int old_flags = fcntl(backend_fd, F_GETFL, 0);
                     bool connected = old_flags >= 0 && fcntl(backend_fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
                     int connect_error = connected ? 0 : errno;
@@ -147,6 +155,8 @@ void ProxyCore::start() {
                     return;
                 }
 
+                // Only count a live upstream session. The shared tracker removes
+                // this count after both relay directions have finished.
                 selected_backend->active_connections.fetch_add(1);
                 auto tracker = std::make_shared<ConnectionTracker>(selected_backend, client_fd, backend_fd);
 
@@ -165,6 +175,8 @@ void ProxyCore::start() {
 }
 
 void ProxyCore::relay_traffic(int from_fd, int to_fd, std::shared_ptr<ConnectionTracker> tracker) {
+    // One call moves one direction. The stack buffer bounds temporary copy
+    // space; blocking recv/send keeps this comparison model simple to inspect.
     char buffer[8192];
     bool fatal = false;
     

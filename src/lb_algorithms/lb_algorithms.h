@@ -3,12 +3,13 @@
 #include <string>
 #include "../common/backend.h"
 
-// Base interface for all Load Balancing Algorithms
+// Strategy interface: both I/O cores call the same policy, keeping routing
+// independent from whether connections use threads or epoll.
 class LbAlgorithm {
 public:
     virtual ~LbAlgorithm() = default;
 
-    // Selects a backend from the pool.
-    // client_ip is passed for algorithms like Consistent Hashing that need it.
+    // Return a pointer into the shared pool, or nullptr when none are eligible.
+    // Selection happens once per TCP connection; only hashing needs client_ip.
     virtual Backend* select_backend(std::vector<Backend>& backends, const std::string& client_ip) = 0;
 };

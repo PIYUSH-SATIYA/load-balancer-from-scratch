@@ -9,6 +9,8 @@
 #include <netdb.h>
 #include <cstring>
 
+// Maximum ready events returned by one epoll_wait call; this is a batch size,
+// not a limit on how many descriptors the epoll instance can register.
 #define MAX_EVENTS 1024
 
 EpollCore::EpollCore(int port, std::vector<Backend>& backends, std::shared_ptr<LbAlgorithm> algorithm, bool passive_failover)
@@ -20,6 +22,7 @@ EpollCore::~EpollCore() {
 }
 
 bool EpollCore::set_non_blocking(int fd) {
+    // Preserve existing file-status flags and add O_NONBLOCK for the event loop.
     int flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
@@ -45,7 +48,11 @@ void EpollCore::update_session_epoll(std::shared_ptr<Session> session) {
 
     if (session->client_fd >= 0) {
         uint32_t c_events = 0;
+        // Stop reading when the destination queue is full: this applies
+        // backpressure instead of growing an unbounded userspace queue.
         if (!session->client_read_closed && (!session->c2b_buffer || session->c2b_buffer->space() > 0)) c_events |= EPOLLIN;
+        // EPOLLOUT is normally always-ready. Subscribe only while there are
+        // bytes to flush, or the loop would wake repeatedly without progress.
         if (session->b2c_buffer && !session->b2c_buffer->empty()) c_events |= EPOLLOUT;
         
         if (c_events != session->client_events) {
@@ -91,6 +98,8 @@ void EpollCore::start() {
         return;
     }
     int opt = 1;
+    // SO_REUSEPORT allows each worker's independent listener to share a port;
+    // SO_REUSEADDR makes restarting the listener practical after a prior run.
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     if (!set_non_blocking(server_fd)) {
@@ -108,11 +117,15 @@ void EpollCore::start() {
         return;
     }
 
+    // SOMAXCONN asks for the platform's maximum listen backlog; the kernel may
+    // cap it further through system settings.
     if (listen(server_fd, SOMAXCONN) < 0) {
         LOG_ERROR("Listen failed: " << strerror(errno));
         return;
     }
 
+    // One epoll instance belongs to this core/worker and watches listener plus
+    // every client/upstream socket it owns.
     epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         LOG_ERROR("epoll_create1 failed: " << strerror(errno));
@@ -130,7 +143,12 @@ void EpollCore::start() {
 
     struct epoll_event events[MAX_EVENTS];
 
+    // Level-triggered readiness is the default: if data remains unread, the fd
+    // is reported again. Handlers can therefore do bounded work per event.
     while (true) {
+        // Sleep until an event when no upstream connect is pending. Otherwise
+        // wake every 50 ms to enforce connect_timeout_ms even if no readiness
+        // event arrives for a blackholed destination.
         int timeout_ms = pending_connects.empty() ? -1 : 50;
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, timeout_ms);
         if (nfds < 0 && errno != EINTR) break;
@@ -254,6 +272,8 @@ bool EpollCore::connect_session_backend(std::shared_ptr<Session> session) {
     pending_connects.erase(session);
     session->backend_connected = false;
 
+    // At most one attempt per configured backend in this session prevents a
+    // failed pool from creating an infinite retry loop.
     size_t max_retries = passive_failover ? backends.size() : 1;
     while (session->failover_retries < max_retries) {
         session->failover_retries++;
@@ -303,6 +323,8 @@ bool EpollCore::connect_session_backend(std::shared_ptr<Session> session) {
 
         sessions[backend_fd] = session;
 
+        // EPOLLOUT signals either connect completion or room to flush queued
+        // bytes, so subscribe while connecting and recompute after SO_ERROR.
         session->backend_events = EPOLLIN | EPOLLOUT;
         struct epoll_event ev_b;
         ev_b.events = EPOLLIN | EPOLLOUT;
@@ -340,6 +362,8 @@ bool EpollCore::connect_session_backend(std::shared_ptr<Session> session) {
 }
 
 void EpollCore::handle_new_connection() {
+    // With a nonblocking listener, accept until EAGAIN: one readiness event can
+    // represent multiple clients already queued in the kernel backlog.
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -389,6 +413,8 @@ void EpollCore::handle_new_connection() {
 }
 
 void EpollCore::handle_client_read(std::shared_ptr<Session> session) {
+    // Allocate only when bytes arrive. If connect is still pending, preserve
+    // the request in this bounded buffer until SO_ERROR confirms connection.
     if (!session->c2b_buffer) {
         session->c2b_buffer = std::make_unique<Buffer>();
     }
@@ -446,6 +472,8 @@ void EpollCore::handle_client_write(std::shared_ptr<Session> session) {
 }
 
 void EpollCore::handle_backend_read(std::shared_ptr<Session> session) {
+    // Symmetric path for backend-to-client data; a full buffer disables further
+    // upstream reads until the client socket can accept more bytes.
     if (!session->b2c_buffer) {
         session->b2c_buffer = std::make_unique<Buffer>();
     }
@@ -500,6 +528,8 @@ void EpollCore::handle_backend_write(std::shared_ptr<Session> session) {
 }
 
 void EpollCore::close_session(std::shared_ptr<Session> session) {
+    // Idempotence matters: error, EOF, timeout, and failed epoll_ctl paths may
+    // converge on cleanup. Marking closed prevents double accounting/close.
     if (session->fully_closed) return;
 
     pending_connects.erase(session);

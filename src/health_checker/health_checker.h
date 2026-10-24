@@ -6,6 +6,8 @@
 
 class HealthChecker {
 public:
+    // Keep a reference to the shared objects so status changes immediately
+    // affect the routing algorithms' view of backend eligibility.
     HealthChecker(std::vector<Backend>& backends, int interval_seconds);
     ~HealthChecker();
 

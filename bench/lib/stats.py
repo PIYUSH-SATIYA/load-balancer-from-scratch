@@ -9,7 +9,8 @@ import math
 import statistics
 from typing import List, Dict, Any, Optional
 
-# Two-tailed t-distribution critical values for 95% confidence (alpha = 0.05)
+# Small-sample t critical values for a 95% interval. With one repetition there
+# is no variance estimate, so a confidence interval cannot be computed honestly.
 # Index corresponds to degrees of freedom df = n - 1 (df from 1 to 30)
 STUDENT_T_95 = {
     1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,

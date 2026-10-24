@@ -47,7 +47,8 @@ async def measure_active_latency(host: str, port: int, samples: int = 20) -> flo
     try:
         reader, writer = await asyncio.open_connection(host, port)
         req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
-        # 1 warmup transaction
+        # Verify the path before opening the large target set. These probe
+        # sockets are separate from, and not counted among, held idle sessions.
         writer.write(req)
         await writer.drain()
         response = await read_http_response(reader)
@@ -87,7 +88,8 @@ async def run(target_conns: int, host: str = "127.0.0.1", port: int = 8080,
         tasks = []
         for j in range(cur_batch):
             conn_idx = i + j
-            # If targeting loopback and target > 15000, rotate local loopback IP across 127.0.0.1, 127.0.0.2, etc.
+            # Linux routes all of 127/8 to loopback. Binding multiple local
+            # source IPs spreads port tuples and reduces TIME_WAIT reuse clashes.
             if host in ("127.0.0.1", "localhost"):
                 octets = source_ip_base.split(".")
                 octets[3] = str(int(octets[3]) + (conn_idx // 15000))

@@ -20,6 +20,8 @@ def free_port() -> int:
 
 
 def backend_process(port: int) -> None:
+    # Wait for request EOF before responding so the test requires the proxy to
+    # propagate a half-close and keep the reverse direction open for the reply.
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", port))
@@ -37,6 +39,8 @@ def backend_process(port: int) -> None:
             print(f"test backend received {len(request)} bytes", flush=True)
             if not request:
                 return
+            # The digest detects corruption; the large body forces multiple
+            # bounded relay-buffer flushes instead of one small send.
             response = hashlib.sha256(request).digest() + b"R" * RESPONSE_SIZE
             try:
                 client.sendall(response)
@@ -98,6 +102,8 @@ def run_mode(binary: Path, mode: str) -> dict:
         wait_ready(proxy, proxy_port)
         time.sleep(0.05)
 
+        # Exactly 1 MiB of varied bytes. shutdown(SHUT_WR) closes only the
+        # request direction; the client must continue reading the response.
         request = bytes(range(256)) * 4096
         expected = hashlib.sha256(request).digest() + b"R" * RESPONSE_SIZE
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as client:

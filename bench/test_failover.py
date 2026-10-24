@@ -51,6 +51,8 @@ def stop_process(process: subprocess.Popen | None) -> None:
 
 
 def start_lb(binary: Path, lb_port: int, passive: bool) -> subprocess.Popen:
+    # -h 1 makes active detection visible in this short trial. In active_only
+    # mode -F isolates health-check detection; passive mode uses default retries.
     command = [str(binary), "-e", "-p", str(lb_port), "-h", "1"]
     if not passive:
         command.append("-F")
@@ -96,6 +98,8 @@ async def send_probe(index: int, host: str, port: int) -> dict:
 
 
 async def stream_probes(host: str, port: int, rate: int, duration: float) -> list[dict]:
+    # Schedule against monotonic deadlines rather than sleeping after each
+    # response, so probe latency does not progressively lower the target rate.
     start = time.monotonic()
     tasks = []
     index = 0
@@ -121,6 +125,8 @@ def run_trial(binary: Path, backend_binary: Path, lb_port: int, passive: bool,
             backends.append(start_backend(backend_binary, port))
         lb = start_lb(binary, lb_port, passive)
 
+        # Keep requests flowing while backend2 is down, and timestamp each
+        # phase so drops/re-entry can be interpreted from actual observations.
         async def trial():
             probe_task = asyncio.create_task(stream_probes("127.0.0.1", lb_port, rate, duration))
             start = time.monotonic()
@@ -170,6 +176,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trials", nargs="?", type=int, default=20)
     parser.add_argument("--port", type=int, default=8080)
+    # Defaults keep this repeatable experiment short: 20 probes/s over 7 s.
     parser.add_argument("--rate", type=int, default=20)
     parser.add_argument("--duration", type=float, default=7.0)
     parser.add_argument("--outage", type=float, default=2.5)

@@ -11,7 +11,9 @@
 #include <unordered_set>
 
 struct Buffer {
-    char data[16384]; // 16KB static buffer
+    // Fixed capacity bounds queued user bytes in this direction. Session owns
+    // Buffers lazily, so idle connections do not allocate both 16 KiB buffers.
+    char data[16384];
     int head = 0;
     int tail = 0;
 
@@ -34,6 +36,8 @@ struct Buffer {
 };
 
 struct Session {
+    // This state machine joins one client fd and one backend fd. The event loop
+    // is single-threaded, so its mutable fields do not need per-session locks.
     int client_fd = -1;
     int backend_fd = -1;
     Backend* backend_node = nullptr; // To decrement active_connections
@@ -67,10 +71,14 @@ private:
     std::vector<Backend>& backends;
     std::shared_ptr<LbAlgorithm> algorithm;
     bool passive_failover;
+    // Avoid retaining sessions for the kernel's much longer connect timeout
+    // when a backend drops SYNs or a route is blackholed.
     int connect_timeout_ms = 250;
     int server_fd;
     int epoll_fd;
 
+    // Both descriptors map to one session because readiness may arrive on
+    // either socket; shared ownership simplifies teardown/retry paths.
     std::unordered_map<int, std::shared_ptr<Session>> sessions;
     std::unordered_set<std::shared_ptr<Session>> pending_connects;
 

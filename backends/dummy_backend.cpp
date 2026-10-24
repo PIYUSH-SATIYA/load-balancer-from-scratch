@@ -17,6 +17,8 @@ struct ClientState {
 };
 
 bool set_nonblocking(int fd) {
+    // The test responder also uses readiness notifications, so accept/read/write
+    // must return promptly instead of blocking the event loop on one client.
     const int flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
@@ -29,6 +31,8 @@ void close_client(int epoll_fd, int fd, std::unordered_map<int, ClientState>& cl
 } // namespace
 
 int main(int argc, char* argv[]) {
+    // One process per backend port lets Compose/harness create independent
+    // upstreams while keeping response behavior identical across them.
     int port = 9000;
     if (argc > 1) port = std::stoi(argv[1]);
 
@@ -38,6 +42,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Reuse the local port during repeated benchmark/test process restarts.
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in address{};
@@ -76,6 +81,8 @@ int main(int argc, char* argv[]) {
         "Connection: keep-alive\r\n\r\n"
         "Hello, World!";
     std::unordered_map<int, ClientState> clients;
+    // This is only the number of ready client events processed per wait batch;
+    // more connections can remain registered and be returned in later batches.
     epoll_event events[256];
 
     while (true) {
@@ -120,6 +127,8 @@ int main(int argc, char* argv[]) {
             }
 
             if (events[i].events & EPOLLIN) {
+                // The dummy backend does not parse HTTP; reading any bytes is
+                // enough to trigger a fixed test response.
                 char buffer[4096];
                 const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
                 if (n == 0) {

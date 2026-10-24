@@ -29,6 +29,8 @@ def read_int(path: Path):
 
 
 def snapshot(pid: int, include_cgroup: bool):
+    # Process metrics describe the exact proxy PID. Optional cgroup values add
+    # container-wide memory/pid pressure; host-mode runs leave them unavailable.
     proc = Path(f"/proc/{pid}")
     status = (proc / "status").read_text()
     pss = status_kb((proc / "smaps_rollup").read_text(), "Pss")

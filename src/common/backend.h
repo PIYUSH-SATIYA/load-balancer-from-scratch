@@ -13,6 +13,8 @@ enum class BackendStatus {
 };
 
 struct Backend {
+    // Status and counters cross the health-check, selection, and session
+    // cleanup threads, so use atomics instead of one lock around all access.
     std::string ip;
     int port;
     std::atomic<BackendStatus> status;
@@ -30,6 +32,8 @@ struct Backend {
 
     bool resolve_address() {
         std::lock_guard<std::mutex> lock(address_mutex);
+        // Cache successful IPv4 resolution. A failure stays retryable if DNS
+        // becomes available later.
         if (addr_resolved.load()) return true;
         struct addrinfo hints, *res = nullptr;
         memset(&hints, 0, sizeof(hints));
@@ -44,11 +48,13 @@ struct Backend {
         return false;
     }
     
-    // Delete copy constructor/assignment because of std::atomic
+    // Atomics/mutexes cannot be copied. Backends live in a vector, so allow
+    // moving values as that vector grows during CLI parsing.
     Backend(const Backend&) = delete;
     Backend& operator=(const Backend&) = delete;
     
-    // Enable move semantics
+    // Transfer the current values; the destination gets its own default
+    // mutex, which protects future resolutions of that destination object.
     Backend(Backend&& other) noexcept 
         : ip(std::move(other.ip)), 
           port(other.port), 

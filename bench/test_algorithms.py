@@ -48,6 +48,8 @@ def response_backend(sock: socket.socket) -> int:
 
 
 def request(host: str, port: int, source_ip: str = "127.0.0.1", keep_open: bool = False):
+    # Use a fresh TCP session to test connection-level routing. Held sockets are
+    # needed only for least-connections, where occupancy changes later choices.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(3)
     sock.bind((source_ip, 0))
@@ -89,6 +91,8 @@ def stop_lb(process: subprocess.Popen) -> None:
 
 
 def read_stats(process: subprocess.Popen, log) -> dict:
+    # Backend response headers show each mapping; SIGUSR1 counters provide a
+    # second check against the proxy's own routing-selection accounting.
     os.kill(process.pid, signal.SIGUSR1)
     time.sleep(0.1)
     log.flush()

@@ -16,6 +16,8 @@ def stop(_signum, _frame):
 
 
 def snapshot(pid: int) -> dict[int, tuple[int, int]]:
+    # Read each proxy thread's counters, not the wrk process's counters, so
+    # scheduler activity can be compared for the service implementation.
     result = {}
     task_root = Path(f"/proc/{pid}/task")
     try:
