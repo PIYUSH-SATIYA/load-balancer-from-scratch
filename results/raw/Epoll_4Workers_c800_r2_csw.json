@@ -1,8 +1,0 @@
-{
-  "pid": 57723,
-  "interval_seconds": 0.1,
-  "samples": 51,
-  "threads_sampled": 7,
-  "voluntary_context_switches": 33544,
-  "nonvoluntary_context_switches": 1671
-}
