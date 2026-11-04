@@ -46,5 +46,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Local research inputs; these are not consumed by the build or benchmark suite.
-papers/
+# Local research inputs; keep them ignored except for the standalone project paper.
+papers/*
+!papers/ieee_tcp_load_balancer_project_report.tex
