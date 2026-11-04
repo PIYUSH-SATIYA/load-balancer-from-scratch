@@ -7,6 +7,8 @@
 
 namespace Logger {
 
+// Synchronous stderr logging keeps this small project dependency-free; it is
+// intentionally not a high-throughput production logging subsystem.
 inline std::string current_time() {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);

@@ -26,12 +26,15 @@ def parse_time_to_ms(time_str: str) -> float:
     return val
 
 def parse_wrk_output(text: str) -> dict:
+    # Convert wrk's human-readable output into stable key/value data for CSV.
+    # Missing fields stay detectable instead of being silently invented here.
     """Parse complete wrk stdout text and return structured metrics dictionary."""
     metrics = {
         "rps": 0.0,
         "p50_ms": 0.0,
         "p75_ms": 0.0,
         "p90_ms": 0.0,
+        "p95_ms": 0.0,
         "p99_ms": 0.0,
         "p99_9_ms": 0.0,
         "mean_lat_ms": 0.0,
@@ -81,6 +84,8 @@ def parse_wrk_output(text: str) -> dict:
             metrics["p75_ms"] = ms_val
         elif abs(p_float - 90.0) < 0.1:
             metrics["p90_ms"] = ms_val
+        elif abs(p_float - 95.0) < 0.1:
+            metrics["p95_ms"] = ms_val
         elif abs(p_float - 99.0) < 0.1:
             metrics["p99_ms"] = ms_val
         elif abs(p_float - 99.9) < 0.1:

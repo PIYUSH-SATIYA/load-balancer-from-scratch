@@ -1,18 +1,16 @@
-# C++ Load Balancer from Scratch
+# C++ TCP Proxy: A Systems Learning Project
 
-A high-performance Layer 4 (TCP) Load Balancer built completely from scratch in modern C++ (C++17). 
-
-This project explores the fundamental building blocks of networked applications and distributed systems, simulating the core architectures of production tools like Nginx and HAProxy.
+A small Layer 4 TCP proxy written in modern C++17. This repository is a learning project for practicing sockets, connection lifecycles, routing, health checks, and the difference between thread-per-connection and `epoll` event loops. It does not aim to be a production proxy or to reproduce NGINX/HAProxy features.
 
 ## Features Built
 1. **Multi-Architecture Support:**
-   - **Thread-Per-Connection (`ProxyCore`)**: Spawns two threads per connection to handle bidirectional traffic. Achieves extreme throughput on multi-core systems but scales poorly with memory.
-   - **Asynchronous Event Loop (`EpollCore`)**: A single-threaded `epoll`-based event loop (C10k solution) that scales to tens of thousands of connections using minimal memory, mirroring Nginx and Redis architectures.
+   - **Thread-Per-Connection (`ProxyCore`)**: Spawns two threads per connection to handle bidirectional traffic. This makes the concurrency model easy to inspect and demonstrates the memory and scheduling cost of many threads.
+   - **Asynchronous Event Loop (`EpollCore`)**: A single-threaded `epoll`-based event loop that demonstrates event-driven I/O without one proxy thread per connection. Its measured capacity depends on the host and is recorded in the benchmark artifacts.
 2. **Routing Algorithms**:
    - `round_robin`: Distributes connections evenly across all available backends.
    - `least_connections`: Tracks active connection counts and routes to the least busy backend.
    - `consistent_hashing`: Hashes the client IP to ensure the same client always hits the same backend (useful for session affinity).
-3. **Active Health Checking**: A background thread continuously probes backends, dynamically removing them from the routing pool if they crash and re-adding them when they recover.
+3. **Active Health Checking**: A background thread periodically probes backends, removing them from the routing pool when marked down and re-adding them after recovery.
 4. **Graceful Teardown**: Proper handling of TCP half-closes and signal-handling (SIGINT, SIGTERM, SIGPIPE).
 
 ## Project Iterations
@@ -35,14 +33,14 @@ When freshly cloning the repository, the backends require the `/app/build/dummy_
 
 ### 1. Initial Build & Startup
 ```bash
-# 1. Build the Docker images (Ubuntu 24.04 with cmake, g++, wrk)
-docker compose build
+# 1. Build the shared development image once (Ubuntu 24.04 with cmake, g++, wrk)
+docker compose build loadbalancer
 
-# 2. Compile the binaries inside the container volume
-docker compose run --rm loadbalancer bash -c "cd /app && cmake -B build -S . && cmake --build build"
+# 2. Compile the binaries as root into the named build volume
+docker compose run --rm --user root loadbalancer bash -c "cd /app && cmake -B build -S . && cmake --build build"
 
 # 3. Spin up all containers in the background
-docker compose up -d
+docker compose up -d --no-build
 
 # 4. Verify all 5 containers are up
 docker compose ps
@@ -128,9 +126,9 @@ docker compose exec loadbalancer pkill -SIGUSR1 loadbalancer
 The load balancer process will immediately print the stats table to stderr:
 ```text
 === [STATS] Backend Status ===
-backend1:9001 | Status: UP | Active Conns: 0 | Total Requests: 1
-backend2:9002 | Status: UP | Active Conns: 0 | Total Requests: 1
-backend3:9003 | Status: UP | Active Conns: 0 | Total Requests: 1
+backend1:9001 | Status: UP | Active Conns: 0 | Backend Selections: 1
+backend2:9002 | Status: UP | Active Conns: 0 | Backend Selections: 1
+backend3:9003 | Status: UP | Active Conns: 0 | Backend Selections: 1
 ==============================
 ```
 
@@ -151,7 +149,7 @@ You will receive `Hello, World!` with `Connection: keep-alive`. **`nc` will rema
 
 While `nc` is open, run `pkill -SIGUSR1 loadbalancer` in another terminal. You will see:
 ```text
-backend1:9001 | Status: UP | Active Conns: 1 | Total Requests: 1
+backend1:9001 | Status: UP | Active Conns: 1 | Backend Selections: 1
 ```
 When you exit `nc` (Ctrl+C), `Active Conns` drops back to `0`.
 
@@ -174,14 +172,15 @@ docker compose exec loadbalancer pkill -9 loadbalancer
 
 ## Comprehensive Benchmarking Suite
 
-The project features four dedicated benchmark suites located in `bench/`:
+The project has five local behavior and benchmark scripts in `bench/`:
 
 | Benchmark Suite | Script | Description |
 | :--- | :--- | :--- |
-| **1. Active Throughput & Latency** | `bench/run_bench.sh` | Uses `wrk` across concurrency levels (50 to 800) to measure RPS, P50/P99 latencies, CPU saturation, and context switches across 6 architectures (`Control`, `Epoll_Optimized`, `Epoll_4Workers`, `Threaded_Proxy`, `Threaded_4Cores`, `Nginx_Stream`). Appends results to `results/summary.csv`. |
-| **2. C10K / C30K Idle Scalability** | `bench/run_idle_test.sh` + `bench/idle_client.py` | Uses Python `asyncio` with loopback IP rotation (`127.0.0.1/8`) to hold 10,000 to 30,000 persistent idle connections. Measures memory footprint (RSS/PSS), thread count, and active probe latency under connection load into `results/idle_sweep_isolated.csv`. |
-| **3. High-Availability Failover** | `bench/test_failover.py` | Runs Monte Carlo trials streaming 20 req/s while injecting `SIGKILL` into backends. Compares Active-only failover (`-F`, 2.6s convergence) vs Passive Failover (0 dropped requests via 250ms connect timeout). |
-| **4. Algorithm Empirical Validation** | `bench/test_algorithms.py` | Empirically validates Round Robin circularity, Least Connections routing away from loaded nodes, and Consistent Hashing session affinity across 30 client IPs. |
+| **1. Active Throughput & Latency** | `bench/run_bench.sh` | Uses `wrk` across concurrency levels (50 to 800) to measure RPS, P50/P90/P99 latencies, host busy time on the pinned CPU set (not process CPU), and context switches across proxy modes, a direct-backend control, and Nginx. Replaces `results/summary.csv` for each run and preserves raw output under `results/raw/`. |
+| **2. Idle Connection Sweep** | `bench/run_idle_test.sh` + `bench/idle_client.py` | Attempts 10,000 to 30,000 persistent idle connections. Runs the client outside the proxy container, rotates source IPs between cells to avoid `TIME_WAIT` port reuse, and samples the exact proxy PID for RSS, PSS, virtual size, threads, FDs, and open-file limits. Records partial and failed runs with client errors. |
+| **3. Backend Failure & Recovery** | `bench/test_failover.py` | Runs repeated 20-probe/s trials while stopping and restarting a backend. Records every probe for active-only and passive retry modes; zero failures means no recovery interval was measured. |
+| **4. TCP Half-Close Check** | `bench/test_half_close.py` | Sends a 1 MiB request, half-closes the client write side, and verifies the complete large backend response through both proxy modes. |
+| **5. Routing Algorithm Checks** | `bench/test_algorithms.py` | Checks round-robin distribution, least-connections behavior with held sessions, and consistent-hash affinity across 30 client IPs. Writes individual trial data to JSON. |
 
 ### Running the Benchmarks:
 
@@ -190,17 +189,23 @@ The project features four dedicated benchmark suites located in `bench/`:
 docker compose exec loadbalancer bash -c \
   "WARMUP_SEC=1 DURATION_SEC=2 N_RUNS=1 CONNS_OVERRIDE='50' /app/bench/run_bench.sh Epoll_Optimized Nginx_Stream"
 
-# 2. Idle Scalability Sweep (C10K with 5s hold):
+# 2. Idle connection sweep (5s hold):
 HOLD_SEC=5 bash bench/run_idle_test.sh
 
-# 3. Failover & Recovery Monte Carlo Trials (5 runs):
-python3 bench/test_failover.py 5
+# 3. Failover & Recovery trials (5 runs per mode):
+python3 bench/test_failover.py 5 --port 18081
 
-# 4. Routing Algorithm Suite:
-docker compose exec -T loadbalancer python3 /app/bench/test_algorithms.py
+# 4. TCP half-close and payload preservation in both proxy modes:
+python3 bench/test_half_close.py
+
+# 5. Routing Algorithm Suite (starts local test backends):
+python3 bench/test_algorithms.py --runs 5 --port 18080
+
+# 6. Regenerate the report from the current CSV and JSON artifacts:
+python3 bench/generate_report.py
 ```
 
-Detailed performance data and analysis can be found in [`docs/benchmark_report.md`](file:///home/pbs/Desktop/projects/load-balancer-from-scratch/docs/benchmark_report.md).
+This is a systems-learning project, not a product target or an NGINX/HAProxy replacement. Measurements are local experiments for comparing implementation choices; they do not establish production performance. Detailed methodology and current results are in [`docs/benchmark_report.md`](docs/benchmark_report.md).
 
 ---
 

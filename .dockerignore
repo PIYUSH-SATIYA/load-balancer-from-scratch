@@ -1,0 +1,7 @@
+papers/
+**/papers/
+.git/
+build/
+build-host/
+__pycache__/
+*.py[cod]

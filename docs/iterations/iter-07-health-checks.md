@@ -16,7 +16,7 @@ The health checker thread writes to `backend.status`, while the proxy core threa
 ### 3. Non-Blocking Sockets (`O_NONBLOCK`)
 When `HealthChecker` tries to connect to a backend to see if it's alive, we set the socket to `O_NONBLOCK` using `fcntl`.
 *Why this matters:* If a backend server completely dies or its network cable is cut, a standard blocking `connect()` call can hang for the operating system's default TCP timeout (which is often *over 2 minutes*!). If our health checker hangs for 2 minutes on one backend, it can't check the others. 
-By making it non-blocking, `connect()` immediately returns `EINPROGRESS`. We then use the POSIX `select()` system call with a strict 2-second timeout. If it doesn't succeed in 2 seconds, we aggressively mark the server as DOWN.
+By making it non-blocking, `connect()` immediately returns `EINPROGRESS`. We then use `poll()` with a 2-second timeout and inspect `SO_ERROR` to decide whether the probe connected. A failed probe marks the server DOWN.
 
 ## How to Verify This Iteration
 
@@ -25,6 +25,6 @@ By making it non-blocking, `connect()` immediately returns `EINPROGRESS`. We the
    `docker compose kill backend2`
 3. Watch the proxy logs. Within a few seconds, the background thread will notice the failure and print:
    `[WARN] HealthCheck: backend2:9002 is now DOWN`
-4. Send a few requests to the proxy:
+4. After the health checker reports the backend DOWN, send a few requests to the proxy:
    `echo 'A' | nc -q 0 127.0.0.1 8080`
-5. You will see that the algorithm seamlessly skips `backend2` and continues routing traffic to the healthy nodes!
+5. Confirm that new connections are routed to healthy nodes while the failed backend remains marked DOWN. The interval before detection can include failed requests; passive retry is a separate behavior measured by the failover suite.

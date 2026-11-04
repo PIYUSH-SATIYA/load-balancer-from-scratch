@@ -2,13 +2,13 @@
 
 ## 1. Project Overview
 
-This project aims to design and implement a **Layer-4 TCP Load Balancer from scratch in C++**, without relying on any third-party networking libraries. The goal is to build a high-performance network proxy that intelligently distributes incoming TCP traffic across a pool of backend servers.
+This project designs and implements a **Layer-4 TCP proxy in C++**, without relying on third-party networking libraries. Its purpose is to learn socket programming, connection lifecycles, routing strategies, health checks, and two concurrency models by building a small system and measuring its behavior.
 
-What makes this project academically meaningful is its **incremental, phase-gated construction methodology**: each module is built, tested, and validated before the next is layered on top. This mirrors real systems engineering practice and ensures that every layer of the final system is well-understood and demonstrably correct.
+The project is built incrementally so each module can be studied and exercised before the next is added. The accompanying checks and benchmark scripts provide evidence about selected behaviors; they do not prove general correctness.
 
-By the end of the project, we will have a fully functional load balancer supporting **three routing algorithms**, **active health checking with automatic failover**, and a **non-blocking `epoll`-based concurrency model** — all benchmarked against Nginx under identical controlled conditions to produce a genuine empirical comparison.
+The implementation demonstrates **three routing algorithms**, **active health checking with failover**, and a **non-blocking `epoll`-based concurrency model**. Nginx is included as a separate reference in a small local experiment. This project is not intended as a product or as an NGINX/HAProxy clone.
 
-This document serves as a formal proposal for the professor, outlining the system's requirements, module architecture, phased development plan, and a structured 5-week execution timeline.
+This document outlines the learning goals, module architecture, requirements, and an example phased development plan.
 
 ---
 
@@ -28,7 +28,7 @@ The system must support three pluggable routing strategies:
 
 - **Round Robin:** Maintains a shared atomic counter. Each new connection is routed to backend `counter % N`, then the counter is incremented. Requires no knowledge of current connection state, making it a stateless and fast algorithm.
 - **Least Connections:** Maintains a per-backend active connection counter. On each new connection, the backend with the minimum active count is selected. The counter is incremented on connect and decremented on disconnect. A shared mutex guards these counters to prevent race conditions under concurrent load.
-- **Consistent Hashing:** Maps both backend identifiers and incoming client IPs onto a fixed-size numeric ring. A new connection is hashed by client IP and routed to the next backend clockwise on the ring. This ensures **session stickiness** (same client always reaches the same backend) and **minimal reshuffling** when backends are added or removed — only ~1/N of mappings change.
+- **Consistent Hashing:** Maps backend identifiers and incoming client IPs onto a numeric ring. A new connection is hashed by client IP and routed to the next backend clockwise on the ring. The behavior check verifies that a client IP keeps its backend across reconnects while the backend set remains unchanged. Minimal remapping after a backend-set change is a known property to explore, not a behavior currently validated by the harness.
 
 #### FR-03: Active Health Checking
 A dedicated background thread must periodically probe each configured backend server (using a lightweight TCP `connect()` attempt). The result updates a shared backend status table (UP/DOWN). The health check interval must be configurable.
@@ -46,7 +46,7 @@ The load balancer must not require recompilation to change operational parameter
 - Listening port for the proxy.
 
 #### FR-06: Operational Observability
-The system must log which backend each connection is routed to, and emit aggregate statistics (requests served per backend, backends currently marked as UP/DOWN) on demand (e.g., via a `SIGUSR1` signal or on clean exit).
+The system must log which backend each connection is routed to, and emit aggregate statistics (connections routed per backend and backend UP/DOWN status) on demand (e.g., via `SIGUSR1`). A Layer 4 proxy cannot count HTTP requests without parsing the payload.
 
 ---
 
@@ -54,8 +54,8 @@ The system must log which backend each connection is routed to, and emit aggrega
 
 #### NFR-01: Concurrency & Scalability
 The system must handle a large number of simultaneous client connections:
-- **Phase 1 (Thread-per-Connection):** Each accepted connection spawns a dedicated `std::thread` to handle relay. This is simple and correct, but does not scale past ~thousands of connections due to OS thread limits.
-- **Phase 2 (`epoll`-based Event Loop):** A single-threaded non-blocking I/O loop using `epoll()` replaces Phase 1. Only sockets with pending I/O events are serviced, allowing the system to handle tens of thousands of concurrent connections within a single thread.
+- **Phase 1 (Thread-per-Connection):** Each accepted connection uses two `std::thread` relay loops, one for each direction. This is straightforward to inspect and demonstrates the scheduling and memory costs of per-connection threads.
+- **Phase 2 (`epoll`-based Event Loop):** A single-threaded non-blocking I/O loop using `epoll()` provides a contrasting model. Its capacity is measured on the available host; large connection counts are a learning target, not a guaranteed result.
 
 #### NFR-02: Thread Safety
 Any shared mutable state (backend status table, connection counters, round-robin index) must be protected by appropriate synchronization primitives (`std::mutex`, `std::atomic`). The system must be free of data races and undefined behavior under concurrent load.
@@ -68,11 +68,11 @@ The load balancer must not crash or enter an inconsistent state due to:
 
 #### NFR-04: Performance Benchmarking
 The system's performance must be empirically measured under reproducible conditions. Metrics to be captured include:
-- p50, p95, and p99 latency percentiles.
+- p50, p90, and p99 latency percentiles emitted by `wrk --latency`.
 - Throughput (requests/second).
-- Failover recovery time (time from backend death to zero traffic reaching it).
+- Probe failures during an outage and the first successful probe routed to the recovered backend after restart.
 
-These metrics must be measured for both our load balancer and Nginx configured identically, enabling a data-driven analysis of where and why the performance differs.
+The throughput comparison uses the same backend pool and round-robin behavior for the proxy and Nginx reference. Failover is measured separately with the local proxy harness. The results support discussion of this setup; they do not generalize to other workloads or machines.
 
 #### NFR-05: Portability & Build
 The system must build cleanly on a Linux environment (native or WSL2) using a standard `g++`/`clang++` compiler with CMake or Make. It must not rely on any networking libraries beyond the POSIX socket API and the C++ standard library.
@@ -134,7 +134,7 @@ The system is designed around a clean separation of concerns, with each module o
 
 ### Module 5: Benchmark & Evaluation Harness
 - Uses `wrk` as the load generation tool.
-- Nginx configured with identical backend pool and round-robin algorithm as the control variable.
+- Nginx configured with the same backend pool and round-robin behavior for the limited throughput comparison.
 - Both systems tested with identical concurrency levels, request counts, and warm-up periods.
 - `ulimit -n` raised before all tests to prevent artificial file-descriptor caps from skewing results.
 - Separate failover test: a backend is killed mid-benchmark run; recovery time is measured for both systems.
@@ -204,9 +204,9 @@ The project is structured as a sequence of incremental milestones. **Each milest
 | 1 | Study `man 2 epoll` in depth. This is done *after* having a working blocking proxy — the contrast makes the motivation and mechanics immediately clear. |
 | 2–4 | Rewrite the Proxy Core: all sockets set to `O_NONBLOCK`. Single `epoll` instance. `epoll_wait()` drives the main loop. Maintain a per-connection state machine (CONNECTING, RELAYING, CLOSING). |
 | 5–6 | Validate: the `epoll` version must pass all the same manual tests as the Week 1–2 implementation. |
-| 7 | Run a concurrency comparison: `wrk -c 500` and `wrk -c 5000` against both the thread-per-connection and `epoll` versions. Record thread counts and memory usage. **The thread-per-connection version is preserved in a separate Git branch** — it is the production fallback if `epoll` is incomplete. |
+| 7 | Run a concurrency comparison against the thread-per-connection and `epoll` versions. Record achieved connections, thread counts, and memory use. |
 
-> **Risk Note:** This is the highest-risk phase of the project. If `epoll` development over-runs the schedule, the thread-per-connection version with all three algorithms and health checks is a complete, fully gradeable deliverable on its own. An incomplete or buggy `epoll` rewrite is strictly worse. The Git branch strategy is non-negotiable.
+> **Learning note:** The blocking and event-driven implementations are retained together so their connection handling and resource costs can be compared directly.
 
 **Milestone:** The `epoll` version handles 5,000 concurrent connections in a single thread without spawning additional OS threads, passing the same correctness tests as the blocking version.
 
@@ -214,35 +214,24 @@ The project is structured as a sequence of incremental milestones. **Each milest
 
 ### Week 5: Benchmarking, Empirical Evaluation & Final Report
 
-**Goal:** Produce a rigorous, data-driven comparison between our load balancer and Nginx.
+**Goal:** Record a repeatable local comparison between the learning proxy and an Nginx reference, then inspect the limits of the measurements.
 
 | Day | Tasks |
 |-----|-------|
-| 1–2 | Configure Nginx's `upstream` module with an identical backend pool and round-robin algorithm. **Freeze this config before any test run begins** to ensure the control variable is not changed mid-experiment. |
-| 3–4 | Write `wrk`-driving scripts: warm-up period discarded; record p50/p95/p99 latency and requests/second at multiple concurrency levels. Raise `ulimit -n` before all tests to remove the artificial file-descriptor cap. |
-| 5 | Kill a backend mid-benchmark for both systems; measure and compare failover recovery time. |
-| 6–7 | Write the final report. The report must cover methodology, raw data tables, and — critically — an honest analysis of *why* the numbers differ from Nginx, not just that they do. This gap analysis (e.g., Nginx's production-tuned event loop, kernel bypass via `sendfile`, adaptive memory allocation) is the intellectual contribution that separates this from a simple demonstration. |
+| 1–2 | Configure Nginx with the same backend pool and round-robin behavior used by the proxy comparison. |
+| 3–4 | Write `wrk`-driving scripts: discard a warm-up period and record the percentiles emitted by `wrk --latency` plus request throughput at multiple concurrency levels. Raise `ulimit -n` before the connection sweeps. |
+| 5 | Stop and restart a backend during proxy traffic; record failed probes and the first probe routed back to the recovered backend. |
+| 6–7 | Write a report with methodology, raw data tables, and a careful discussion of what this particular comparison can and cannot show. |
 
-**Milestone:** A complete dataset with p50/p95/p99 latency, throughput, and failover recovery time for both systems under identical conditions, plus a final report explaining the results.
+**Milestone:** A dataset for the local round-robin throughput comparison and a separate proxy failover experiment, with methodology and limitations in the report.
 
 ---
 
-## 5. Current Progress
+## 5. Status Update
 
-The project is currently in **Week 1 / early Week 2** of the execution timeline. The following has been completed:
+This proposal records the intended learning goals; it is not a claim that every requirement has been exhaustively validated. The repository now contains a blocking TCP proxy, an `epoll` proxy, three routing algorithms, health checks, CLI configuration, and benchmark harnesses. Current benchmark evidence and its limits are reported separately in [`benchmark_report.md`](./benchmark_report.md), generated from the checked-in run artifacts.
 
-- Development environment, build system, and project directory structure are set up.
-- Core C++ module files have been initialized:
-  - [`src/proxy_core/proxy_core.cpp`](../src/proxy_core/proxy_core.cpp) — TCP relay skeleton
-  - [`src/lb_algorithms/lb_algorithms.cpp`](../src/lb_algorithms/lb_algorithms.cpp) — Algorithm interface stub
-  - [`src/health_checker/health_checker.cpp`](../src/health_checker/health_checker.cpp) — Health check loop skeleton
-  - [`src/main.cpp`](../src/main.cpp) — Entry point and module wiring
-- The incremental build plan has been formally documented in [`docs/load_balancer_stepwise_plan.md`](./load_balancer_stepwise_plan.md).
-
-**Immediate next steps:**
-1. Finalize the dumb proxy relay loop and validate it is crash-safe on backend failure.
-2. Implement the Round Robin counter and the thread-per-connection model.
-3. Move to configurable backend list and config parsing before introducing shared state (Least Connections).
+The implementation remains a small systems-learning exercise. A passing compile or local benchmark does not establish general correctness, production readiness, or equivalence to a mature proxy.
 
 ---
 
@@ -253,7 +242,7 @@ The project is currently in **Week 1 / early Week 2** of the execution timeline.
 | `epoll` rewrite over-runs the schedule | Medium | High | Preserve thread-per-connection in a separate Git branch as a ready fallback at all times |
 | Subtle race condition in Least Connections | High | Medium | Use `std::mutex` (correct, simple) before considering atomics; add concurrent stress tests early |
 | Benchmark results invalidated by `ulimit` | Medium | High | Always raise `ulimit -n` before any load test; document baseline system limits |
-| Inconsistent Nginx vs. ours comparison | Medium | High | Freeze Nginx config before all test runs; do not alter it mid-experiment |
+| Inconsistent Nginx vs. ours comparison | Medium | Medium | Record configuration and machine settings with each benchmark run |
 | Consistent Hashing churn analysis over-runs | Low | Low | Keep the algorithm; drop deep churn analysis if time is short |
 
 ---
@@ -264,5 +253,5 @@ Beyond producing a functional artifact, this project demonstrates competency acr
 
 1. **Deep Systems Understanding:** Building from raw POSIX socket syscalls requires understanding what `bind()`, `listen()`, `accept()`, and `connect()` actually do at the kernel level. This surfaces the exact mental models needed to debug real production networking issues.
 2. **Concurrency Engineering:** Designing safe shared state (mutex-protected connection counters, health status tables) and then optimizing the concurrency model with `epoll` demonstrates the full spectrum of concurrent systems design — from correctness first, to performance second.
-3. **Empirical Thinking:** Benchmarking against an industry-standard system with a rigorous methodology (frozen control variables, warm-up periods, percentile reporting, deliberate failure injection) reflects real performance engineering practice — not just "my code runs fast."
-4. **Incremental, Risk-Managed Delivery:** The phase-gated approach with a preserved fallback branch demonstrates professional software delivery discipline: shipping something complete and correct, with a defined contingency, rather than an ambitious but broken system.
+3. **Empirical Thinking:** Recording local benchmark settings, warm-up periods, latency percentiles, and failure-injection outcomes provides practice in reading evidence and its limits.
+4. **Incremental Learning:** Building a simpler blocking version before the event loop provides a concrete way to compare two concurrency models and examine their trade-offs.

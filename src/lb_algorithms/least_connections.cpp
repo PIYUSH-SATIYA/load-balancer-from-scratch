@@ -5,10 +5,10 @@ Backend* LeastConnections::select_backend(std::vector<Backend>& backends, const 
         return nullptr;
     }
 
-    // We use a lock here to satisfy our learning objective regarding mutexes.
-    // While `active_connections` is atomic, locking the whole scan prevents 
-    // the state from shifting underneath us while we iterate, ensuring we 
-    // make a decision based on a single consistent snapshot in time.
+    // Serialize selections so concurrent callers do not all scan and choose
+    // the same currently-light backend at once. Counters stay atomic because
+    // setup/teardown updates happen outside this mutex. This is still a
+    // best-effort snapshot: counts can change while this scan runs.
     std::lock_guard<std::mutex> lock(mtx);
 
     Backend* least_loaded = nullptr;
@@ -25,7 +25,7 @@ Backend* LeastConnections::select_backend(std::vector<Backend>& backends, const 
     }
 
     if (least_loaded) {
-        least_loaded->total_requests.fetch_add(1);
+        least_loaded->backend_selections.fetch_add(1);
     }
 
     return least_loaded;

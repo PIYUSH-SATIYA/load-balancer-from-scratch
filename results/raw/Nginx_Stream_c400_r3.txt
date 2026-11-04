@@ -1,0 +1,13 @@
+Running 5s test @ http://nginx-comparison:8080/
+  4 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.72ms    0.90ms  13.53ms   80.93%
+    Req/Sec    21.22k     0.99k   24.46k    67.00%
+  Latency Distribution
+     50%    4.53ms
+     75%    5.17ms
+     90%    5.73ms
+     99%    7.65ms
+  422735 requests in 5.03s, 49.99MB read
+Requests/sec:  84036.76
+Transfer/sec:      9.94MB

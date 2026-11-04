@@ -1,15 +1,19 @@
-# === Stage 1: Development Environment ===
+# The dev stage has tools and runtime dependencies for interactive work. Source
+# is bind-mounted by Compose so edits on the host are immediately visible.
 FROM ubuntu:24.04 AS dev
 
 RUN apt-get update && apt-get install -y \
-    build-essential cmake git \
-    libssl-dev unzip libpcre3-dev zlib1g-dev \
+    build-essential cmake git ca-certificates \
     netcat-openbsd curl iproute2 python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# wrk isn't in Ubuntu's default repos — build it once, bake into image
-RUN git clone https://github.com/wg/wrk.git /tmp/wrk \
-    && cd /tmp/wrk && make && cp wrk /usr/local/bin/ \
+RUN apt-get update && apt-get install -y unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# wrk is built into the image so the throughput harness can run without a
+# separate host install. Pin a revision separately for strictly repeatable runs.
+RUN git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk \
+    && cd /tmp/wrk && make -j"$(nproc)" && cp wrk /usr/local/bin/ \
     && rm -rf /tmp/wrk
 
 WORKDIR /app
@@ -17,13 +21,8 @@ WORKDIR /app
 # We sleep infinity so the container stays alive for dev usage.
 CMD ["sleep", "infinity"]
 
-# === Stage 2: Build ===
+# Optional self-contained production-style binary build. Compose targets dev
+# for iteration; this stage is not the container used by the final host run.
 FROM dev AS build
 COPY . /app
 RUN mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-
-# === Stage 3: Production (Lean) ===
-FROM ubuntu:24.04 AS prod
-COPY --from=build /app/build/loadbalancer /usr/local/bin/
-COPY --from=build /app/build/dummy_backend /usr/local/bin/
-CMD ["loadbalancer"]

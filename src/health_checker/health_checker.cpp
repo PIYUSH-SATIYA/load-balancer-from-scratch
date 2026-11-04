@@ -27,6 +27,8 @@ void HealthChecker::start() {
 }
 
 bool HealthChecker::check_backend(const std::string& ip, int port) {
+    // A separate short-lived TCP socket isolates probes from user sessions.
+    // A successful handshake tests reachability, not application correctness.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
 
@@ -50,8 +52,8 @@ bool HealthChecker::check_backend(const std::string& ip, int port) {
     if (result == 0) {
         is_up = true; // Connected immediately
     } else if (result < 0 && errno == EINPROGRESS) {
-        // Use poll instead of select! select/fd_set overflows when sock >= 1024,
-        // causing __FD_SET_chk buffer overflow aborts during high connection tests.
+        // poll accepts arbitrary fd numbers. select's fixed fd_set can fail
+        // once this socket number exceeds FD_SETSIZE during high-connection runs.
         struct pollfd pfd;
         pfd.fd = sock;
         pfd.events = POLLOUT;
@@ -92,7 +94,8 @@ void HealthChecker::check_loop() {
             }
         }
 
-        // Sleep until the next interval
+        // The interval is measured between full sequential sweeps; this simple
+        // design is not a separately scheduled deadline per backend.
         std::this_thread::sleep_for(std::chrono::seconds(interval_seconds));
     }
 }

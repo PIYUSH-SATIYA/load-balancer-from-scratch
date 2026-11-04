@@ -1,23 +1,31 @@
 services:
   loadbalancer:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
     volumes:
+      # Source stays editable on the host; build outputs persist in a named
+      # volume so a container rebuild does not erase compiled binaries.
       - .:/app
       - build_cache:/app/build
     ports:
       - "8080:8080"
     depends_on:
-      - backend1
-      - backend2
-      - backend3
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
     networks:
       - lbnet
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
+        # A proxy needs two descriptors per proxied TCP connection. Make the
+        # container limit configurable for high-connection exercises.
+        soft: ${LB_NOFILE_LIMIT:-131072}
+        hard: ${LB_NOFILE_LIMIT:-131072}
     # Will run manually during dev
 
   nginx-comparison:
@@ -28,12 +36,15 @@ services:
       - "8081:8080"
     networks:
       - lbnet
+    # Keep Nginx off the default proxy CPU in the benchmark's chosen topology.
+    cpuset: "${LB_NGINX_CPUS:-0}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend1:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -43,12 +54,21 @@ services:
     command: ["/app/build/dummy_backend", "9001"]
     networks:
       - lbnet
+    healthcheck:
+      # Compose waits for a listening TCP socket before starting the proxy;
+      # this is only readiness, not an application-level health contract.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9001"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend2:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -58,12 +78,21 @@ services:
     command: ["/app/build/dummy_backend", "9002"]
     networks:
       - lbnet
+    healthcheck:
+      # Same readiness check as backend1; Compose starts dependents only when
+      # each backend's TCP listener accepts connections.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9002"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
   backend3:
+    image: load-balancer-from-scratch:dev
     build:
       context: .
       target: dev
@@ -73,12 +102,20 @@ services:
     command: ["/app/build/dummy_backend", "9003"]
     networks:
       - lbnet
+    healthcheck:
+      # Keep readiness checks consistent across the identical backend services.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9003"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    cpuset: "${LB_BACKEND_CPUS:-8-11}"
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
 
 networks:
+  # User-defined bridge provides service-name DNS (backend1, backend2, ...).
   lbnet:
     driver: bridge
 

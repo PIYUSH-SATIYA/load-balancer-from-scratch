@@ -5,13 +5,15 @@
 
 class ConsistentHashing : public LbAlgorithm {
 public:
-    // We pass the initial backends to pre-compute the hash ring
+    // Build a fixed ring at startup; dynamic pool changes are not implemented.
     ConsistentHashing(const std::vector<Backend>& initial_backends, int virtual_nodes = 100);
     ~ConsistentHashing() override = default;
 
     Backend* select_backend(std::vector<Backend>& backends, const std::string& client_ip) override;
 
 private:
+    // Replicas improve expected spread with a small pool; 100 balances ring
+    // size against smoother ownership ranges for this learning project.
     int virtual_nodes;
     
     // The Hash Ring. 
